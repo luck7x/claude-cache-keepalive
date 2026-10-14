@@ -182,8 +182,11 @@ export const register: Register = on => {
       }
       anchor = last.at
       note = ''
-      if (!isVerified) await schedule(last.at + CANARY_AFTER, 'canary')
-      else if (max > 0) await schedule(anchor + PING_AFTER + Math.random() * JITTER, 'ping')
+      // Turned on some minutes after the last request: a time already past means
+      // "soon", not "late" (the 57-minute check in fire still guards a lapsed cache).
+      const soon = (await $.clock.now()) + 5_000
+      if (!isVerified) await schedule(Math.max(last.at + CANARY_AFTER, soon), 'canary')
+      else if (max > 0) await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, soon), 'ping')
       else note = '上限为 0，不续'
       return publish()
     }

@@ -1,10 +1,18 @@
 {
   "name": "cache-keepalive",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Opt-in prompt-cache keep-alive for Claude Code's main conversation: refreshes the 1h cache via $.model.fork before it lapses, canary-verified, capped and fail-closed.",
-  "author": { "name": "luck7x", "url": "https://github.com/luck7x" },
+  "author": {
+    "name": "luck7x",
+    "url": "https://github.com/luck7x"
+  },
   "homepage": "https://github.com/luck7x/claude-cache-keepalive",
   "repository": "https://github.com/luck7x/claude-cache-keepalive",
   "license": "Apache-2.0",
-  "keywords": ["prompt-cache", "keepalive", "cost", "mod"]
+  "keywords": [
+    "prompt-cache",
+    "keepalive",
+    "cost",
+    "mod"
+  ]
 }
