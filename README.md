@@ -23,7 +23,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 - 使用 Claude Code 官方 mod 接口 `$.model.fork`：由 Claude Code **自己**发出请求，复用主会话最后一次请求的模型、系统提示、工具和消息，末尾追加一句"只回复一个点"。
 - 这次请求**不写进对话记录**，不能调用工具，不在新内容上打缓存标记。
-- 不碰你的凭证，不经过任何代理或网关。
+- 插件不读取你的凭证，也不连接任何第三方。续命是一次真实的模型请求，走的是你当前 Claude Code 配置的服务商（如果你配置了网关或 Bedrock / Vertex，就经过它们）。
 
 实测（Opus 5.5，约 300k 上下文）：读缓存 319k、写 0、输出 3 token，回复 `"."`。
 
@@ -55,14 +55,14 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 | 命令 | 作用 |
 |---|---|
-| `/keepalive on` | 普通模式：每次离开最多续 2 次（约撑 2 小时 42 分） |
+| `/keepalive on` | 普通模式：每次离开最多续 2 次（约撑 2 小时 42 分）；会话第一次开启时另有 1 次验证 |
 | `/keepalive 5`、`/keepalive 8h`、`/keepalive 2h30m` | 只对这一次离开加长；写时长会按"大概多久回来"自动算次数 |
 | `/keepalive max` | 常驻模式：每次离开都最多续 24 次（约 21 小时），回来后不重置 |
 | `/keepalive now` | 立刻续一次（不计入次数） |
 | `/keepalive off` | 关闭本会话 |
 | `/keepalive off <会话id前几位>` | 从任一窗口关闭别的会话 |
-| `/keepalive status` | 本会话状态，含上一次续命读/写/输出了多少 |
-| `/keepalive list` | 本机所有开着续命的会话 |
+| `/keepalive status` | 本会话状态；本次离开期间最近一次续命读/写/输出了多少 |
+| `/keepalive list` | 本机开着续命的窗口；正常关闭的窗口不在其中，异常退出的会显示为"已失联" |
 
 ### 时间线
 
@@ -78,7 +78,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 ### 安全设计：一有疑问就不发
 
-续命最大的风险是"以为在续，其实在整段重写"。所以：
+续命最大的风险是"以为在续，其实在整段重写"。下面这些检查都会在发出请求前再确认一遍，但它们是尽力而为，不是绝对保证：
 
 - **首次验证**：读到的缓存必须 ≥ 预期前缀的 90%、写入 ≤ 10%，否则自动关闭。
 - **任何一次没命中**：本次离开不再续。
@@ -88,8 +88,16 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 - **正在对话、刚压缩、换了模型、上一轮被中断**：不续，等下一轮正常结束再计时。
 - **5 小时或 7 天额度 ≥ 95%**：跳过。
 - **单次输出 > 100 token**：本次离开不再续（`$.model.fork` 不支持设置 max_tokens，只能事后熔断）。
-- **多窗口**：全局锁，同一时间只有一个会话在续，其他错开 20–50 秒。
+- **多窗口**：用共享锁尽量让同一时间只有一个会话在续，其他错开 20–50 秒、只重试一次。存储不支持原子操作，极少数情况下两个会话可能同时发出；两次都是各自本来就要续的，不会多花钱。
+- **`/clear`、`/resume` 切换会话**：新会话不继承旧会话的开关和验证状态；`/clear` 会清掉旧会话的记录。
+- **上限为 0**（如 `/keepalive 1h`）：不验证也不续。临时上限（数字或时长）都会在它能撑到的时间过后自动失效，热重载也会保留它。
+- **Claude Code 热重载插件**：如果当时正在对话，等这一轮结束才重新计时；不在对话中则接着之前的计划续。
 - 关掉窗口，定时器随进程结束。
+
+### 本地保存了什么
+
+- 插件存储（Claude Code 管理）：每个开过续命的会话一条开关记录，以及它最近一次请求的时间、上下文大小和模型名；3 天没出现的会话会被清理。
+- 状态文件 `~/.cache/claude-cache-keepalive/<session_id>.json`：会话 id、项目目录、模型名、token 数、续命进度。不保存对话内容，也不保存续命回复的原文，只记录回复是不是预期的 "."。
 
 ### 状态显示
 
@@ -116,7 +124,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 ### 已知限制
 
-- mod 接口是 Claude Code 的早期功能，后续版本可能变化；插件出错时会停止续命，不会多花钱。
+- mod 接口是 Claude Code 的早期功能，后续版本可能变化。插件出错时会停止本次续命；但它只能尽量避免多余请求，不能绝对保证。
 - 无法硬性限制续命请求的输出长度，见上文。
 - 订阅账号不直接扣费，但续命同样消耗 5 小时 / 7 天额度。
 
@@ -139,7 +147,7 @@ The cache expires after 60 minutes without use. Each read resets that clock, so 
 
 - Uses Claude Code's own mod API `$.model.fork`: Claude Code itself sends a request over the main thread's last request (same model, system prompt, tools and messages) with one short prompt appended ("reply with a single dot").
 - The fork is **not written to the transcript**, cannot use tools, and puts no cache marker on its own tail.
-- It never touches your credentials and goes through no proxy or gateway.
+- The plugin never reads your credentials and contacts no third party. Each refresh is a real model request through whatever provider Claude Code is configured with (your gateway, Bedrock or Vertex if you use one).
 
 Measured on Opus 5.5 with ~300k context: 319k read from cache, 0 written, 3 output tokens, reply `"."`.
 
@@ -171,18 +179,21 @@ Off by default; enabled per session, each window on its own.
 
 | Command | Effect |
 |---|---|
-| `/keepalive on` | Normal mode: up to 2 refreshes per absence (~2h42m) |
+| `/keepalive on` | Normal mode: up to 2 refreshes per absence (~2h42m); plus one canary the first time in a session |
 | `/keepalive 5`, `/keepalive 8h`, `/keepalive 2h30m` | Longer cap for this absence only; a duration is turned into the refreshes needed |
 | `/keepalive max` | Always-on mode: up to 24 refreshes (~21h) every absence, kept after you return |
 | `/keepalive now` | Refresh once right now (not counted) |
 | `/keepalive off` | Turn off for this session |
 | `/keepalive off <id prefix>` | Turn off another session from any window |
-| `/keepalive status` | This session, including the last refresh's read/write/output |
-| `/keepalive list` | All sessions on this machine with keep-alive on |
+| `/keepalive status` | This session, with the read/write/output of the latest refresh in the current absence |
+| `/keepalive list` | Windows on this machine with keep-alive on; windows closed normally are not listed, ones that crashed show as lost |
 
 How long the cache lasts = refreshes × 51 min + 60 min. Each refresh adds 0–60 s of jitter.
 
 ### Safety: when in doubt, don't send
+
+These checks are re-run right before a request goes out; they are best effort, not hard guarantees.
+
 
 - **Canary** on first enable: it must read ≥ 90% of the expected prefix and write ≤ 10%, or the plugin turns itself off.
 - **Any miss** stops refreshing for the rest of that absence.
@@ -192,8 +203,16 @@ How long the cache lasts = refreshes × 51 min + 60 min. Each refresh adds 0–6
 - **Turn in progress, just compacted, model changed, last turn interrupted**: not refreshed until the next normal turn.
 - **5-hour or 7-day quota ≥ 95%**: skipped.
 - **Output > 100 tokens** in one refresh: no more refreshes that absence (`$.model.fork` takes no max_tokens).
-- **Several windows**: a shared lock lets one fork run at a time; others retry 20–50 s later.
+- **Several windows**: a shared lock tries to keep one fork at a time; others retry once 20–50 s later. The store has no atomic write, so on rare occasions two sessions may send at once; each was due anyway, so it costs nothing extra.
+- **`/clear`, `/resume`**: a new conversation inherits neither the switch nor the canary of the old one; `/clear` deletes the old one's records.
+- **Cap 0** (e.g. `/keepalive 1h`): no canary, no refresh. A one-off cap (count or time) lapses when the cache it buys would, and survives a reload of the mod.
+- **A reload of the mod**: mid-turn, it waits for the turn to end; otherwise it carries on with the schedule.
 - Closing the window ends its timers.
+
+### What is kept locally
+
+- The plugin store (managed by Claude Code): per session with keep-alive on, its switch and its last request's time, context size and model; sessions not seen for 3 days are removed.
+- Status files `~/.cache/claude-cache-keepalive/<session_id>.json`: session id, project directory, model, token counts, progress. No conversation content and no reply text, only whether the reply was the expected ".".
 
 ### Status
 
@@ -207,7 +226,7 @@ It only keeps the cache of the moment you left. A new session, `/clear`, or rewi
 
 ### Limitations
 
-- The mod API is an early Claude Code feature and may change; on errors the plugin stops refreshing rather than spending more.
+- The mod API is an early Claude Code feature and may change. On errors the plugin stops refreshing for that absence; it avoids extra requests as best it can but cannot guarantee it.
 - The output length of a refresh cannot be hard-capped (see above).
 - On a subscription nothing is billed per request, but refreshes count toward the 5-hour / 7-day limits.
 

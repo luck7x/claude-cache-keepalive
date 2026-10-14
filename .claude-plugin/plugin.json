@@ -1,6 +1,6 @@
 {
   "name": "cache-keepalive",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Opt-in prompt-cache keep-alive for Claude Code's main conversation: refreshes the 1h cache via $.model.fork before it lapses, canary-verified, capped and fail-closed.",
   "author": {
     "name": "luck7x",
