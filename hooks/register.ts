@@ -25,8 +25,8 @@ const LOCK_MS = 90_000 // one fork at a time across sessions
 const QUOTA_STOP = 95 // skip pings once a 5h / 7d window is this full (%)
 const OUTPUT_MAX = 100 // a fork that writes more than this is not a cheap ping
 const FORGET_AFTER = 3 * DAY // store records of sessions not seen for this long
-const EFFORT_EVERY = MIN // how often an idle session looks for an effort change
-const EFFORT_CHANGED = '思考等级（effort）已改，续命已自动关闭；需要时 /keepalive on'
+const EFFORT_EVERY = 2_000 // how often an idle session looks for an effort change (a local read)
+const EFFORT_CHANGED = 'effort-changed' // blocker's answer: pause, don't stop
 const BUSY_FOR = 6 * 60 * MIN // a turn marker older than this is a crash, not a turn
 const TOMBSTONE_MAX = 30 * DAY // a session that never came back to take its off in
 // Cache-read USD per million tokens (Anthropic list prices); used only for estimates.
@@ -57,6 +57,7 @@ type Row = {
   next?: number
   nextKind?: Kind | null
   refreshedAt?: number
+  paused?: boolean
   note?: string
   updated?: number
 }
@@ -86,6 +87,7 @@ type Api = {
   offOther: (prefix: string) => Promise<string>
   ttlProblem: () => Promise<string | undefined>
   follow: () => Promise<boolean>
+  watchEffort: () => Promise<void>
   disable: (why: string) => Promise<void>
   followSoon: () => void
 }
@@ -111,6 +113,12 @@ let refreshedAt = 0 // last successful fork, for status lines' countdowns
 let pings = 0
 let isFused = false
 let hasForked = false
+// Effort now differs from the last request's: no refresh (the cache it would keep
+// can't be used at this effort) until it is set back, or a turn runs at the new one.
+let isPaused = false
+let pausedFrom = '' // the effort the cache was written at, for the messages
+let wasArmed = false // a refresh was due when the pause began: only then does a set-back resume it
+let publishing: Promise<void> = Promise.resolve() // publishes run one at a time, newest state last
 let timer: Timer | undefined
 let dueAt = 0
 let dueKind: Kind | undefined
@@ -192,6 +200,9 @@ function forgetSession() {
   pings = 0
   isFused = false
   hasForked = false
+  isPaused = false
+  pausedFrom = ''
+  wasArmed = false
   note = ''
 }
 
@@ -207,11 +218,17 @@ export const register: Register = on => {
       await $.store.set(`on:${id}`, v)
     }
 
-    async function publish() {
+    // Queued: each run reads the state when its turn comes, so the last one written is the newest.
+    function publish(): Promise<void> {
+      publishing = publishing.then(publishNow, publishNow)
+      return publishing
+    }
+
+    async function publishNow() {
       if (!home || !sid) return
       // Fields and target taken together before any await, so a switch can't mix them.
       const id = sid
-      const ui = { isOn, note, base, pings, max, isTimer: !!timer, dueAt, dueKind }
+      const ui = { isOn, isPaused, note, base, pings, max, isTimer: !!timer, dueAt, dueKind }
       const status: Row = {
         sid,
         cwd,
@@ -224,6 +241,7 @@ export const register: Register = on => {
         next: timer ? dueAt : 0,
         nextKind: timer ? (dueKind ?? null) : null,
         refreshedAt,
+        paused: isPaused,
         note,
         updated: 0,
       }
@@ -232,6 +250,7 @@ export const register: Register = on => {
       if (!showStatus || sid !== id) return
       const isStopped = /未命中|出错|熔断|已关闭|被其他窗口/.test(ui.note)
       if (!ui.isOn) return $.ui.status(isStopped ? `♻✗ ${ui.note}` : undefined)
+      if (ui.isPaused) return $.ui.status(undefined)
       const at = ui.isTimer ? new Date(ui.dueAt).toTimeString().slice(0, 5) : ''
       const mode = ui.base === MAX_CAP ? '常驻 ' : ''
       const upcoming = ui.isTimer ? ` · 下次${ui.dueKind === 'canary' ? '验证' : '续命'} ${at}` : ''
@@ -309,11 +328,22 @@ export const register: Register = on => {
       await $.store.delete(`last:${id}`)
     }
 
-    async function schedule(at: number, kind: Kind, isRetry = false) {
+    // `g0`/`id`: the generation and session the caller started in. A caller from an
+    // older stretch (a turn or switch came since) touches nothing, not even the timer.
+    async function schedule(at: number, kind: Kind, g0: number, id: string, isRetry = false) {
+      if (gen !== g0 || sid !== id) return
       cancel()
-      const [g0, id] = [gen, sid]
+      // A refresh held back by a pause is remembered, so a set-back of effort brings it.
+      if (isPaused) {
+        wasArmed = true
+        return
+      }
       const now = await $.clock.now()
       if (gen !== g0 || sid !== id) return // moved on while waiting: no timer for it
+      if (isPaused) {
+        wasArmed = true
+        return
+      }
       dueAt = at
       dueKind = kind
       timer = $.clock.after(Math.max(0, at - now), () => {
@@ -329,6 +359,7 @@ export const register: Register = on => {
     // A main turn just ended: a new idle stretch starts from its last request.
     async function arm() {
       cancel()
+      const [g0, id] = [gen, sid] // the stretch this call is for; a turn or switch ends it
       pings = 0
       isFused = false
       if (!(await synced()) || !last) return publish()
@@ -338,6 +369,11 @@ export const register: Register = on => {
       }
       anchor = last.at
       note = ''
+      const seen = last
+      const moved = await effortMoved(seen)
+      if (gen !== g0 || sid !== id || last !== seen || isBusy) return // a turn or switch took over
+      if (moved !== undefined) return pause(seen, moved, true)
+      isPaused = false
       if (max === 0) {
         note = '上限为 0，不续'
         return publish()
@@ -345,20 +381,23 @@ export const register: Register = on => {
       // Turned on some minutes after the last request: a time already past means
       // "soon", not "late" (the STALE check in fire still guards a lapsed cache).
       const soon = (await $.clock.now()) + 5_000
-      if (!isVerified) await schedule(Math.max(last.at + CANARY_AFTER, soon), 'canary')
-      else await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, soon), 'ping')
+      if (!isVerified) await schedule(Math.max(last.at + CANARY_AFTER, soon), 'canary', g0, id)
+      else await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, soon), 'ping', g0, id)
       return publish()
     }
 
     // After a reload of the mod mid-session: carry on with the pings, never a canary
     // (a reload may land mid-turn, where a canary would only cost money).
-    async function resume() {
-      if (isFused || isBusy || !isOn || !isVerified || !last || last.cached < MIN_PREFIX || pings >= max) return publish()
+    // `canCanary`: known idle (an effort set back), so a pending canary may go out too.
+    async function resume(canCanary = false) {
+      if (isFused || isBusy || isPaused || !isOn || !last || last.cached < MIN_PREFIX || pings >= max) return publish()
+      if (!isVerified && !canCanary) return publish()
       const [g0, id] = [gen, sid]
       const now = await $.clock.now()
-      if (gen !== g0 || sid !== id || isBusy || !isOn || isFused) return
+      if (gen !== g0 || sid !== id || isBusy || isPaused || !isOn || isFused) return
       if (now - anchor > STALE) return publish()
-      await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, now + 5_000), 'ping')
+      if (!isVerified) await schedule(Math.max(last.at + CANARY_AFTER, now + 5_000), 'canary', g0, id)
+      else await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, now + 5_000), 'ping', g0, id)
       return publish()
     }
 
@@ -392,24 +431,68 @@ export const register: Register = on => {
       return `续命请求走的是子代理缓存档，现在是 ${ttl ?? '默认（5m）'}，必须是 1h（settings.json 设 "subagentPromptCacheTtl": "1h"）`
     }
 
-    // Whether the effort setting for the request's model differs from when it was sent.
-    async function effortChanged(seen: Last): Promise<boolean> {
-      if (seen.effortSig === undefined) return false
+    // The effective effort for a model as the settings say now ("null": the model's default).
+    async function effortNow(model: string): Promise<string> {
       const env = await $.env.get('CLAUDE_CODE_EFFORT_LEVEL')
-      return effortSig(await $.settings.read(), env, seen.model) !== seen.effortSig
+      return effortSig(await $.settings.read(), env, model)
+    }
+    const effortName = (sig: string) => String(JSON.parse(sig) ?? '默认')
+
+    // The effort now, when it differs from the one the request was sent with.
+    async function effortMoved(seen: Last): Promise<string | undefined> {
+      if (seen.effortSig === undefined) return undefined
+      const sig = await effortNow(seen.model)
+      return sig !== seen.effortSig ? sig : undefined
+    }
+    const effortChanged = async (seen: Last) => (await effortMoved(seen)) !== undefined
+
+    // Effort moved away from the last request's: hold every refresh, say so once.
+    // A fork already sent is left to settle (its pings and fuses still count).
+    // `armed`: a refresh was due, so setting effort back should bring it back.
+    function pause(seen: Last, nowSig: string, armed: boolean) {
+      if (isPaused) {
+        if (armed) wasArmed = true // a refresh became due during the pause: a set-back brings it
+        return publish()
+      }
+      cancel()
+      isPaused = true
+      wasArmed = armed
+      pausedFrom = seen.effortSig ? effortName(seen.effortSig) : ''
+      const to = effortName(nowSig)
+      note = `effort 已从 ${pausedFrom} 改为 ${to}，续命暂停`
+      $.ui.toast(
+        `缓存续命已暂停：effort ${pausedFrom} → ${to}。改回 ${pausedFrom} 会自动恢复；` +
+          `按 ${to} 发消息会重写一次缓存，之后按新 effort 续命。`,
+        { timeoutMs: 8_000 },
+      )
+      return publish()
     }
 
-    // An effort change turns keep-alive off (the next turn rewrites the cache anyway);
-    // the person turns it on again when they want it. Checked every minute while idle.
+    // Effort is back to what the cache was written at: carry on where the stretch was,
+    // if a refresh was due when it paused.
+    async function unpause() {
+      isPaused = false
+      note = ''
+      $.ui.toast(`effort 已改回 ${pausedFrom}，缓存续命已恢复。`, { timeoutMs: 5_000 })
+      pausedFrom = ''
+      const armed = wasArmed
+      wasArmed = false
+      // A fork in flight schedules the next refresh itself once it settles.
+      return armed && !isForking ? resume(true) : publish()
+    }
+
+    // Effort is watched every couple of seconds while idle, and right after /effort and
+    // /model: a change pauses keep-alive (the ♻ goes), setting it back resumes it.
     async function watchEffort() {
       if (!(await follow())) return
       if (!isOn || isBusy || isCompacting || !last) return
-      const [s0, g, seen] = [sid, gen, last]
-      if (!(await effortChanged(seen))) return
+      const [s0, g, seen, paused] = [sid, gen, last, isPaused]
+      const moved = await effortMoved(seen)
       // Nothing may have moved while the settings were read.
-      if (sid !== s0 || gen !== g || last !== seen || !isOn || isBusy || isCompacting) return
-      await disable(EFFORT_CHANGED)
-      await publish()
+      if (sid !== s0 || gen !== g || last !== seen || isPaused !== paused) return
+      if (!isOn || isBusy || isCompacting) return
+      if (moved !== undefined && !isPaused) await pause(seen, moved, timer !== undefined || isForking)
+      else if (moved === undefined && isPaused) await unpause()
     }
 
     // Takes the cross-session lock: write a token of our own, wait a moment, and
@@ -460,8 +543,9 @@ export const register: Register = on => {
       anchor = Math.max(anchor, seen.at) // the last real request touched the cache too
       const early = await blocker(isManual, seen)
       if (early === EFFORT_CHANGED) {
-        if (gen === g && sid === fireSid) await disable(EFFORT_CHANGED)
-        return publish()
+        const moved = await effortMoved(seen)
+        if (gen !== g || sid !== fireSid) return publish()
+        return moved !== undefined ? pause(seen, moved, true) : resume(true) // set back already: keep the stretch
       }
       if (early !== undefined) {
         if (early && !isManual) await stopStretch(early)
@@ -478,7 +562,7 @@ export const register: Register = on => {
         // Another session is forking: one more try shortly, if there is still room.
         const retry = (await $.clock.now()) + 20_000 + Math.random() * 30_000
         if (!isRetry && retry - anchor < STALE - MIN) {
-          await schedule(retry, kind, true)
+          await schedule(retry, kind, g, fireSid, true)
           return publish()
         }
         await stopStretch('其他会话占用，本次不续')
@@ -491,8 +575,9 @@ export const register: Register = on => {
         // Last look: nothing may have moved while the checks and the lock were awaited.
         const late = await blocker(isManual, seen)
         if (late === EFFORT_CHANGED) {
-          if (gen === g && sid === fireSid) await disable(EFFORT_CHANGED)
-          return publish()
+          const moved = await effortMoved(seen)
+          if (gen !== g || sid !== fireSid) return publish()
+          return moved !== undefined ? pause(seen, moved, true) : resume(true) // set back already: keep the stretch
         }
         if (gen !== g || late !== undefined) {
           if (late && !isManual && gen === g) await stopStretch(late)
@@ -505,7 +590,10 @@ export const register: Register = on => {
         sent = await $.clock.now()
         // The remote-off check is the last await: nothing runs between it and the fork.
         const isStillOn = isManual || (await synced())
-        if (gen !== g || !isStillOn) {
+        // A pause or a used-up cap that landed during the awaits above stops it here.
+        const isOverCap = !isManual && pings >= max
+        if (gen !== g || !isStillOn || isPaused || isOverCap) {
+          if (isPaused && gen === g && sid === fireSid) wasArmed = true // held back, not dropped
           hasForked = false // no request was made
           if (sid === fireSid) await save()
           return publish()
@@ -568,7 +656,7 @@ export const register: Register = on => {
       }
       if (isBusy || !isOn || isFused) return publish()
       if (kind === 'canary' ? max > 0 : pings < max)
-        await schedule(anchor + PING_AFTER + Math.random() * JITTER, 'ping')
+        await schedule(anchor + PING_AFTER + Math.random() * JITTER, 'ping', g, fireSid)
       else note += '，已达上限'
       return publish()
     }
@@ -651,7 +739,7 @@ export const register: Register = on => {
       return `已关闭会话 ${other.slice(0, 8)} 的续命；它不会再发出续命请求。`
     }
 
-    api = { save, publish, arm, list, cost, now: refreshNow, offOther, ttlProblem, follow, disable, followSoon }
+    api = { save, publish, arm, list, cost, now: refreshNow, offOther, ttlProblem, follow, watchEffort, disable, followSoon }
     home = (await $.env.get('HOME')) ?? ''
     showStatus = (await $.env.get('CACHE_KEEPALIVE_UI_STATUS')) !== '0'
     await load(await $.session.id()) // false: superseded; the state stays off until the next follow()
@@ -739,14 +827,23 @@ export const register: Register = on => {
       ? `，下次${dueKind === 'canary' ? '验证' : '续命'}在 ${fmtMin(dueAt - (await $.clock.now()))} 后`
       : ''
     return {
-      text: `缓存续命：${isOn ? (base === MAX_CAP ? '常驻' : '开') : '关'}，${isVerified ? '已验证' : '未验证'}，本次已续 ${pings}/${max}${upcoming}${note ? `；${note}` : ''}。`,
+      text: `缓存续命：${isOn ? (isPaused ? '暂停（effort 已改）' : base === MAX_CAP ? '常驻' : '开') : '关'}，${isVerified ? '已验证' : '未验证'}，本次已续 ${pings}/${max}${upcoming}${note ? `；${note}` : ''}。`,
     }
+  })
+
+  // Right after /effort or /model, not only on the next poll (a picker may still be
+  // open when this resolves; the poll catches a choice made later).
+  on('command.run', async ($, e, next) => {
+    const r = await next(e)
+    if (e.command === 'effort' || e.command === 'model') void api?.watchEffort().catch(() => undefined)
+    return r
   })
 
   on('turn.start', async ($, e, next) => {
     // Stopping timers and marking busy is safe whatever session the state is for.
     isTurnActive = true
     isBusy = true
+    isPaused = false
     gen += 1
     cancel()
     // A failure here leaves the flags set on purpose: if the turn runs anyway, clearing
