@@ -53,6 +53,8 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 默认**关闭**，按会话开启，每个窗口各自独立。
 
+想让新会话自动开启（普通模式，每次离开最多续 2 次），在 `~/.claude/settings.json` 的 `env` 里加 `"CACHE_KEEPALIVE_DEFAULT": "on"`。只对交互式窗口生效（`claude -p` 和 SDK 不会自动开启）；你对某个会话执行过 `/keepalive off`（包括从别的窗口关闭）后，它一直保持关闭，直到你再 `/keepalive on`。
+
 | 命令 | 作用 |
 |---|---|
 | `/keepalive on` | 普通模式：每次离开最多续 2 次（约撑 2 小时 42 分）；会话第一次开启时另有 1 次验证 |
@@ -86,7 +88,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 - **距上次触碰缓存超过 57 分钟**：跳过。
 - **上下文 < 50k**：不续（重建本来就便宜）。
 - **正在对话、刚压缩、换了模型、上一轮被中断**：不续，等下一轮正常结束再计时。
-- **改了思考等级（effort）**：**续命暂停**并弹出提示，状态行的 ♻ 消失；**改回原来的 effort 会自动恢复**（♻ 重新出现）；按新 effort 发一条消息，则重写一次缓存后按新 effort 续命。空闲时每 2 秒检查一次，`/effort`、`/model` 之后立即检查，续命前也会再查。插件按 Claude Code 的优先级（`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<模型>.effortLevel` → `effortLevel`）取请求发出时生效的那一个值，之后再取，不同就暂停、相同就恢复。只在当前会话生效、没写进设置或环境变量的改动检测不到；从"未设置"改成显式写上模型默认值，会被当作改动（只会少续，不会多花钱）。
+- **改了思考等级（effort）**：在 Opus 5.5、Sonnet 5.5、Haiku 5.5、Fable 5.1 上（API key 或订阅直连），改 effort **不会**让缓存失效（[官方说明](https://code.claude.com/docs/en/prompt-caching#changing-effort-level)），续命照常。其他模型改 effort 会让缓存失效；用了 Bedrock / Vertex / Foundry、设置了 `ANTHROPIC_BASE_URL` 或 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` 时可能失效，插件稳妥起见同样处理。这些情况下：**续命暂停**并弹出提示，状态行的 ♻ 消失；**改回原来的 effort 会自动恢复**；按新 effort 发一条消息，则重写一次缓存后按新 effort 续命。空闲时每 2 秒检查一次，`/effort`、`/model` 之后立即检查，续命前也会再查。插件按 Claude Code 的优先级（`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<模型>.effortLevel` → `effortLevel`）取值。只在当前会话生效、没写进设置或环境变量的改动检测不到；HIPAA 组织等插件检测不到的情况，可能多花一次没命中的续命，随后自动停止。
 - **与空闲压缩互斥**：Claude Code 2.1.299 起会在你离开约 54 分钟、缓存过期前自动压缩较长的对话（空闲压缩）。它看不到续命请求，压缩后续命就白做了。所以**开着续命的会话里，插件会拦下空闲压缩**，`/keepalive status` 会显示"已拦下空闲压缩"；关掉续命后恢复。手动 `/compact` 和上下文满了的自动压缩不受影响。想让所有会话都不做空闲压缩，可以在 `~/.claude/settings.json` 里加 `"idleCompaction": false`。
 - **5 小时或 7 天额度 ≥ 95%**：跳过。
 - **单次输出 > 100 token**：本次离开不再续（`$.model.fork` 不支持设置 max_tokens，只能事后熔断）。
@@ -98,7 +100,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 ### 本地保存了什么
 
-- 插件存储（Claude Code 管理）：每个开过续命的会话一条开关记录，以及它最近一次请求的时间、上下文大小和模型名；3 天没出现的会话会被清理。
+- 插件存储（Claude Code 管理）：每个开过续命的会话一条开关记录，以及它最近一次请求的时间、上下文大小和模型名；3 天没出现的会话会被清理。手动关闭过的会话另有一条只含时间的"已关闭"记录，不会被清理，`/clear` 时删除。
 - 状态文件 `~/.cache/claude-cache-keepalive/<session_id>.json`：会话 id、项目目录、模型名、token 数、续命进度。不保存对话内容，也不保存续命回复的原文，只记录回复是不是预期的 "."。
 
 ### 状态显示
@@ -183,6 +185,8 @@ Answer `y` to add the marketplace, pick a scope (user is recommended). It is act
 
 Off by default; enabled per session, each window on its own.
 
+To have new sessions start on (normal mode, up to 2 refreshes per absence), add `"CACHE_KEEPALIVE_DEFAULT": "on"` to the `env` block of `~/.claude/settings.json`. Interactive windows only (`claude -p` and the SDK never start on); a session you turned off with `/keepalive off` (also from another window) stays off until `/keepalive on`.
+
 | Command | Effect |
 |---|---|
 | `/keepalive on` | Normal mode: up to 2 refreshes per absence (~2h42m); plus one canary the first time in a session |
@@ -207,7 +211,7 @@ These checks are re-run right before a request goes out; they are best effort, n
 - **> 57 min since the cache was last touched**: skipped.
 - **Context < 50k tokens**: not refreshed (rebuilding is cheap).
 - **Turn in progress, just compacted, model changed, last turn interrupted**: not refreshed until the next normal turn.
-- **Effort changed**: **keep-alive pauses** with a notice and the ♻ disappears; **setting effort back resumes it** (the ♻ returns); sending a message at the new effort rewrites the cache once and keep-alive carries on at that effort. Checked every 2 seconds while idle, right after `/effort` and `/model`, and again before a refresh. The plugin takes the effort value that wins in Claude Code's order (`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<model>.effortLevel` → `effortLevel`) when the request leaves, and again later; a difference pauses it, a match resumes it. A change made for the session only, never written to settings or the environment, is not seen; going from unset to writing the model's default explicitly counts as a change (fewer refreshes, never more spend).
+- **Effort changed**: on Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1 (API key or subscription, direct), changing effort **keeps** the cache ([docs](https://code.claude.com/docs/en/prompt-caching#changing-effort-level)) and keep-alive carries on. On other models it invalidates the cache; with Bedrock / Vertex / Foundry, `ANTHROPIC_BASE_URL` or `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` set it may, and the plugin plays safe the same way. In those cases: **keep-alive pauses** with a notice and the ♻ disappears; **setting effort back resumes it**; sending a message at the new effort rewrites the cache once and keep-alive carries on at that effort. Checked every 2 seconds while idle, right after `/effort` and `/model`, and again before a refresh, using Claude Code's order (`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<model>.effortLevel` → `effortLevel`). A change made for the session only is not seen; where the plugin cannot tell (a HIPAA organization, say), one refresh may miss and be paid for before keep-alive stops.
 - **Exclusive with idle compaction**: from Claude Code 2.1.299, a long conversation is compacted about 54 minutes into an absence, before its cache lapses (idle compaction). It does not see keep-alive's refreshes, so compacting throws them away. **In a session with keep-alive on, the plugin holds idle compaction back** (`/keepalive status` says so); turning keep-alive off lets it run again. `/compact` and compaction at a full context are untouched. To stop idle compaction in every session, add `"idleCompaction": false` to `~/.claude/settings.json`.
 - **5-hour or 7-day quota ≥ 95%**: skipped.
 - **Output > 100 tokens** in one refresh: no more refreshes that absence (`$.model.fork` takes no max_tokens).
@@ -219,7 +223,7 @@ These checks are re-run right before a request goes out; they are best effort, n
 
 ### What is kept locally
 
-- The plugin store (managed by Claude Code): per session with keep-alive on, its switch and its last request's time, context size and model; sessions not seen for 3 days are removed.
+- The plugin store (managed by Claude Code): per session with keep-alive on, its switch and its last request's time, context size and model; sessions not seen for 3 days are removed. A session you turned off also keeps a time-only "off" mark that is never cleaned up; `/clear` deletes it.
 - Status files `~/.cache/claude-cache-keepalive/<session_id>.json`: session id, project directory, model, token counts, progress. No conversation content and no reply text, only whether the reply was the expected ".".
 
 ### Status

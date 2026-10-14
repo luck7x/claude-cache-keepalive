@@ -30,6 +30,9 @@ const EFFORT_EVERY = 2_000 // how often an idle session looks for an effort chan
 const EFFORT_CHANGED = 'effort-changed' // blocker's answer: pause, don't stop
 const BUSY_FOR = 6 * 60 * MIN // a turn marker older than this is a crash, not a turn
 const TOMBSTONE_MAX = 30 * DAY // a session that never came back to take its off in
+// Models whose cache survives an effort change on the Claude API (API key or
+// subscription), per Claude Code's prompt-caching docs; elsewhere effort is part of the cache.
+const EFFORT_KEEPS_CACHE = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1']
 // Cache-read USD per million tokens (Anthropic list prices); used only for estimates.
 const CACHE_READ_PRICE: Record<string, number> = {
   'claude-fable-5-1': 0.25,
@@ -43,8 +46,9 @@ const PROMPT =
 
 type Kind = 'canary' | 'ping'
 // `effortSig` is what the settings said about effort when the request was made; a
-// different one later means effort was changed (Claude Code renders effort into the
-// request, so the next turn rewrites the conversation's cache and a refresh is wasted).
+// different one later means effort was changed. Where effort is part of the cache
+// (see EFFORT_KEEPS_CACHE) the next turn then rewrites the conversation's cache and a
+// refresh is wasted; elsewhere a change is ignored.
 type Last = { at: number; cached: number; model: string; effort?: string | number; effortSig?: string }
 type Row = {
   sid?: string
@@ -120,11 +124,14 @@ let isPaused = false
 let pausedFrom = '' // the effort the cache was written at, for the messages
 let wasArmed = false // a refresh was due when the pause began: only then does a set-back resume it
 let publishing: Promise<void> = Promise.resolve() // publishes run one at a time, newest state last
+let saving: Promise<void> = Promise.resolve() // saves land in the order they were made
 let timer: Timer | undefined
 let dueAt = 0
 let dueKind: Kind | undefined
 let note = ''
 let showStatus = true // CACHE_KEEPALIVE_UI_STATUS=0 hides the line under the prompt
+let isDefaultOn = false // CACHE_KEEPALIVE_DEFAULT=on: sessions nobody chose for start on
+let isInteractive = false // a person at the prompt; `-p` runs and the SDK never default on
 // Bumped by anything that must stop a refresh already on its way (a turn, a
 // compaction, off, a session switch); a fork goes out only if it did not move.
 let gen = 0
@@ -211,12 +218,17 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
 
-    async function save() {
+    function save(): Promise<void> {
       // Session and fields as they are now: a switch during the awaits must not mix them.
+      // Queued, so an older save (a default-on) never lands after a newer one (an off).
       const id = sid
       const v: Saved = { isOn, isVerified, at: 0, base, max, capUntil, anchor, pings, isFused, hasForked }
-      v.at = await $.clock.now()
-      await $.store.set(`on:${id}`, v)
+      const write = async () => {
+        v.at = await $.clock.now()
+        await $.store.set(`on:${id}`, v)
+      }
+      saving = saving.then(write, write)
+      return saving
     }
 
     // Queued: each run reads the state when its turn comes, so the last one written is the newest.
@@ -268,6 +280,14 @@ export const register: Register = on => {
         $.store.get(`on:${id}`) as Promise<Saved | undefined>,
         $.clock.now(),
       ])
+      // Nobody chose for this session yet (no record, no off from another window):
+      // CACHE_KEEPALIVE_DEFAULT=on starts it in normal mode, interactive sessions only.
+      const isUnchosen = saved === undefined && isDefaultOn && isInteractive
+      const isDefault =
+        isUnchosen &&
+        (await $.store.get(`off:${id}`)) === undefined &&
+        (await $.store.get(`optout:${id}`)) === undefined &&
+        (await ttlProblem()) === undefined
       const wasOn = saved?.isOn ?? false
       const [stored, busy] = await Promise.all([
         wasOn ? ($.store.get(`last:${id}`) as Promise<Last | undefined>) : Promise.resolve(undefined),
@@ -277,7 +297,7 @@ export const register: Register = on => {
       forgetSession()
       sid = id
       cwd = dir
-      isOn = wasOn
+      isOn = wasOn || isDefault
       isVerified = saved?.isVerified ?? false
       base = saved?.base ?? MAX_PINGS
       const isCapLive = saved?.max !== undefined && (saved.capUntil ?? 0) > now
@@ -290,6 +310,8 @@ export const register: Register = on => {
       hasForked = saved?.hasForked ?? false
       // A reload can land mid-turn: the turn's own marker says so.
       isBusy = isTurnActive || (busy !== undefined && now - busy.at < BUSY_FOR)
+      // Written now, so `/keepalive off <id>` from another window finds it before a turn.
+      if (isDefault) await save()
       return true
     }
 
@@ -442,10 +464,27 @@ export const register: Register = on => {
     // The effort now, when it differs from the one the request was sent with.
     async function effortMoved(seen: Last): Promise<string | undefined> {
       if (seen.effortSig === undefined) return undefined
+      if (await effortKeepsCache(seen.model)) return undefined
       const sig = await effortNow(seen.model)
       return sig !== seen.effortSig ? sig : undefined
     }
     const effortChanged = async (seen: Last) => (await effortMoved(seen)) !== undefined
+
+    // Whether an effort change leaves this model's cache as it is, here. Unsure means no:
+    // a needless pause costs a refresh, a missed one a refresh that rewrites. Any of
+    // these and effort may be part of the cache again (Bedrock, Vertex, Foundry, a
+    // gateway, the betas off); an official base URL is paused for too, to be safe.
+    async function effortKeepsCache(model: string): Promise<boolean> {
+      if (!EFFORT_KEEPS_CACHE.includes(modelKey(model))) return false
+      const set = await Promise.all([
+        $.env.get('CLAUDE_CODE_USE_BEDROCK'),
+        $.env.get('CLAUDE_CODE_USE_VERTEX'),
+        $.env.get('CLAUDE_CODE_USE_FOUNDRY'),
+        $.env.get('CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS'),
+        $.env.get('ANTHROPIC_BASE_URL'),
+      ])
+      return set.every(v => v === undefined || v === '' || v === '0' || v.toLowerCase() === 'false')
+    }
 
     // Effort moved away from the last request's: hold every refresh, say so once.
     // A fork already sent is left to settle (its pings and fuses still count).
@@ -730,6 +769,7 @@ export const register: Register = on => {
       const other = keys[0].slice(3)
       if (other === sid) return ''
       await $.store.set(`off:${other}`, { at: await $.clock.now() })
+      await $.store.set(`optout:${other}`, { at: await $.clock.now() }) // outlives the 3-day cleanup
       try {
         const path = `${statusDir()}/${other}.json`
         const row = JSON.parse(await $.fs.read(path)) as Row
@@ -743,6 +783,8 @@ export const register: Register = on => {
     api = { save, publish, arm, list, cost, now: refreshNow, offOther, ttlProblem, follow, watchEffort, disable, followSoon }
     home = (await $.env.get('HOME')) ?? ''
     showStatus = (await $.env.get('CACHE_KEEPALIVE_UI_STATUS')) !== '0'
+    isDefaultOn = ((await $.env.get('CACHE_KEEPALIVE_DEFAULT')) ?? '').toLowerCase() === 'on'
+    isInteractive = e.isInteractive === true
     await load(await $.session.id()) // false: superseded; the state stays off until the next follow()
 
     // Forget records of sessions not seen for three days; `last:`/`busy:` keys go by
@@ -754,6 +796,8 @@ export const register: Register = on => {
       if (id === sid || !['on:', 'last:', 'busy:', 'off:'].includes(kind)) continue
       const v = (await $.store.get(key)) as { at?: number } | undefined
       if (kind === 'off:') {
+        // A cross-window off from before `optout:` existed: kept as one before anything goes.
+        if ((await $.store.get(`optout:${id}`)) === undefined) await $.store.set(`optout:${id}`, { at: v?.at ?? now })
         const owner = (await $.store.get(`on:${id}`)) as Saved | undefined
         const isTakenIn = owner !== undefined && !owner.isOn && owner.at >= (v?.at ?? 0)
         const isAbandoned = now - (v?.at ?? 0) > TOMBSTONE_MAX
@@ -762,7 +806,11 @@ export const register: Register = on => {
         continue
       }
       if (kind === 'on:' && (await $.store.get(`off:${id}`)) !== undefined) continue // keep it for the check above
-      if (typeof v?.at !== 'number' || now - v.at > FORGET_AFTER) await $.store.delete(key)
+      if (typeof v?.at !== 'number' || now - v.at > FORGET_AFTER) {
+        // An off from before `optout:` existed (1.0.6 and older) is kept as one.
+        if (kind === 'on:' && (v as Saved | undefined)?.isOn === false) await $.store.set(`optout:${id}`, { at: now })
+        await $.store.delete(key)
+      }
     }
     await $.command.register({
       name: 'keepalive',
@@ -788,6 +836,7 @@ export const register: Register = on => {
       const ttl = await api?.ttlProblem()
       if (ttl) return { text: `没有开启：${ttl}。` }
       await $.store.delete(`off:${sid}`)
+      await $.store.delete(`optout:${sid}`)
       isOn = true
       isFused = false
       hasForked = false
@@ -817,6 +866,9 @@ export const register: Register = on => {
       if (done) return { text: done }
     }
     if (verb === 'off') {
+      // A choice that outlives the 3-day cleanup, so CACHE_KEEPALIVE_DEFAULT=on never
+      // turns a resumed session back on; only `/keepalive on|max` or /clear clears it.
+      await $.store.set(`optout:${sid}`, { at: await $.clock.now() })
       base = max = MAX_PINGS
       capUntil = 0
       await api?.disable('')
@@ -963,6 +1015,7 @@ export const register: Register = on => {
       await $.store.delete(`last:${ended}`)
       await $.store.delete(`on:${ended}`)
       await $.store.delete(`off:${ended}`)
+      await $.store.delete(`optout:${ended}`)
     }
     if (e.reason === 'resume') api?.followSoon()
     if (home && ended) await $.fs.write(`${statusDir()}/${ended}.json`, '{}')
