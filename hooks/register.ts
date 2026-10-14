@@ -25,6 +25,8 @@ const LOCK_MS = 90_000 // one fork at a time across sessions
 const QUOTA_STOP = 95 // skip pings once a 5h / 7d window is this full (%)
 const OUTPUT_MAX = 100 // a fork that writes more than this is not a cheap ping
 const FORGET_AFTER = 3 * DAY // store records of sessions not seen for this long
+const EFFORT_EVERY = MIN // how often an idle session looks for an effort change
+const EFFORT_CHANGED = '思考等级（effort）已改，续命已自动关闭；需要时 /keepalive on'
 const BUSY_FOR = 6 * 60 * MIN // a turn marker older than this is a crash, not a turn
 const TOMBSTONE_MAX = 30 * DAY // a session that never came back to take its off in
 // Cache-read USD per million tokens (Anthropic list prices); used only for estimates.
@@ -83,7 +85,7 @@ type Api = {
   now: () => Promise<string>
   offOther: (prefix: string) => Promise<string>
   ttlProblem: () => Promise<string | undefined>
-  follow: () => Promise<void>
+  follow: () => Promise<boolean>
   disable: (why: string) => Promise<void>
   followSoon: () => void
 }
@@ -98,6 +100,9 @@ let capUntil = 0 // for a time given: when that time is up
 let isOn = false
 let isVerified = false
 let isBusy = false
+// A main turn is running in this process. Unlike isBusy it survives a session load
+// (forgetSession), so a load committed mid-turn still knows the turn is on.
+let isTurnActive = false
 let isCompacting = false
 let isForking = false
 let last: Last | undefined
@@ -114,6 +119,7 @@ let showStatus = true // CACHE_KEEPALIVE_UI_STATUS=0 hides the line under the pr
 // Bumped by anything that must stop a refresh already on its way (a turn, a
 // compaction, off, a session switch); a fork goes out only if it did not move.
 let gen = 0
+let loadSeq = 0 // the newest load(); an older one that finishes later is dropped
 
 const kTok = (n: number) => `${Math.round(n / 1000)}k`
 const statusDir = () => `${home}/.cache/claude-cache-keepalive`
@@ -194,12 +200,18 @@ export const register: Register = on => {
     const r = await next(e)
 
     async function save() {
-      const v: Saved = { isOn, isVerified, at: await $.clock.now(), base, max, capUntil, anchor, pings, isFused, hasForked }
-      await $.store.set(`on:${sid}`, v)
+      // Session and fields as they are now: a switch during the awaits must not mix them.
+      const id = sid
+      const v: Saved = { isOn, isVerified, at: 0, base, max, capUntil, anchor, pings, isFused, hasForked }
+      v.at = await $.clock.now()
+      await $.store.set(`on:${id}`, v)
     }
 
     async function publish() {
       if (!home || !sid) return
+      // Fields and target taken together before any await, so a switch can't mix them.
+      const id = sid
+      const ui = { isOn, note, base, pings, max, isTimer: !!timer, dueAt, dueKind }
       const status: Row = {
         sid,
         cwd,
@@ -213,47 +225,62 @@ export const register: Register = on => {
         nextKind: timer ? (dueKind ?? null) : null,
         refreshedAt,
         note,
-        updated: await $.clock.now(),
+        updated: 0,
       }
-      await $.fs.write(`${statusDir()}/${sid}.json`, JSON.stringify(status))
-      if (!showStatus) return
-      const isStopped = /未命中|出错|熔断|已关闭|被其他窗口/.test(note)
-      if (!isOn) return $.ui.status(isStopped ? `♻✗ ${note}` : undefined)
-      const at = timer ? new Date(dueAt).toTimeString().slice(0, 5) : ''
-      const mode = base === MAX_CAP ? '常驻 ' : ''
-      const upcoming = timer ? ` · 下次${dueKind === 'canary' ? '验证' : '续命'} ${at}` : ''
-      $.ui.status(`♻ ${mode}${pings}/${max}${upcoming}${isStopped ? ` · ${note}` : ''}`)
+      status.updated = await $.clock.now()
+      await $.fs.write(`${statusDir()}/${id}.json`, JSON.stringify(status))
+      if (!showStatus || sid !== id) return
+      const isStopped = /未命中|出错|熔断|已关闭|被其他窗口/.test(ui.note)
+      if (!ui.isOn) return $.ui.status(isStopped ? `♻✗ ${ui.note}` : undefined)
+      const at = ui.isTimer ? new Date(ui.dueAt).toTimeString().slice(0, 5) : ''
+      const mode = ui.base === MAX_CAP ? '常驻 ' : ''
+      const upcoming = ui.isTimer ? ` · 下次${ui.dueKind === 'canary' ? '验证' : '续命'} ${at}` : ''
+      $.ui.status(`♻ ${mode}${ui.pings}/${ui.max}${upcoming}${isStopped ? ` · ${ui.note}` : ''}`)
     }
 
     // Load a session's own record; nothing of another session is carried over.
-    async function load(id: string) {
+    // Everything is read first into locals, then committed in one synchronous step,
+    // and only if this is still the newest load and the engine is still on that session.
+    async function load(id: string): Promise<boolean> {
+      const seq = ++loadSeq
+      const [dir, saved, now] = await Promise.all([
+        $.session.cwd(),
+        $.store.get(`on:${id}`) as Promise<Saved | undefined>,
+        $.clock.now(),
+      ])
+      const wasOn = saved?.isOn ?? false
+      const [stored, busy] = await Promise.all([
+        wasOn ? ($.store.get(`last:${id}`) as Promise<Last | undefined>) : Promise.resolve(undefined),
+        $.store.get(`busy:${id}`) as Promise<{ at: number } | undefined>,
+      ])
+      if (seq !== loadSeq || (await $.session.id()) !== id || seq !== loadSeq) return false // superseded
       forgetSession()
       sid = id
-      cwd = await $.session.cwd()
-      const saved = (await $.store.get(`on:${sid}`)) as Saved | undefined
-      isOn = saved?.isOn ?? false
+      cwd = dir
+      isOn = wasOn
       isVerified = saved?.isVerified ?? false
       base = saved?.base ?? MAX_PINGS
-      const now = await $.clock.now()
       const isCapLive = saved?.max !== undefined && (saved.capUntil ?? 0) > now
       max = isCapLive ? (saved?.max ?? base) : base
       capUntil = isCapLive ? (saved?.capUntil ?? 0) : 0
-      last = isOn ? ((await $.store.get(`last:${sid}`)) as Last | undefined) : undefined
+      last = stored
       anchor = Math.max(saved?.anchor ?? 0, last?.at ?? 0)
       pings = saved?.pings ?? 0
       isFused = saved?.isFused ?? false
       hasForked = saved?.hasForked ?? false
       // A reload can land mid-turn: the turn's own marker says so.
-      const busy = (await $.store.get(`busy:${sid}`)) as { at: number } | undefined
-      isBusy = busy !== undefined && now - busy.at < BUSY_FOR
+      isBusy = isTurnActive || (busy !== undefined && now - busy.at < BUSY_FOR)
+      return true
     }
 
     // The engine's session id moves on /clear and /resume without a session.start.
-    async function follow() {
+    // True only when the state in memory is the engine's current session's.
+    async function follow(): Promise<boolean> {
       const id = await $.session.id()
-      if (id === sid) return
-      await load(id)
+      if (id === sid) return true
+      if (!(await load(id)) || sid !== id) return false
       await resume()
+      return sid === id
     }
 
     // /resume raises no event in the new conversation: look once it has settled.
@@ -273,17 +300,20 @@ export const register: Register = on => {
 
     // Off for good, from any path: no timer, no fork in flight counts, no `last:` kept.
     async function disable(why: string) {
+      const id = sid
       cancel()
       gen += 1
       isOn = false
       note = why
       await save()
-      await $.store.delete(`last:${sid}`)
+      await $.store.delete(`last:${id}`)
     }
 
     async function schedule(at: number, kind: Kind, isRetry = false) {
       cancel()
+      const [g0, id] = [gen, sid]
       const now = await $.clock.now()
+      if (gen !== g0 || sid !== id) return // moved on while waiting: no timer for it
       dueAt = at
       dueKind = kind
       timer = $.clock.after(Math.max(0, at - now), () => {
@@ -324,7 +354,9 @@ export const register: Register = on => {
     // (a reload may land mid-turn, where a canary would only cost money).
     async function resume() {
       if (isFused || isBusy || !isOn || !isVerified || !last || last.cached < MIN_PREFIX || pings >= max) return publish()
+      const [g0, id] = [gen, sid]
       const now = await $.clock.now()
+      if (gen !== g0 || sid !== id || isBusy || !isOn || isFused) return
       if (now - anchor > STALE) return publish()
       await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, now + 5_000), 'ping')
       return publish()
@@ -360,6 +392,26 @@ export const register: Register = on => {
       return `续命请求走的是子代理缓存档，现在是 ${ttl ?? '默认（5m）'}，必须是 1h（settings.json 设 "subagentPromptCacheTtl": "1h"）`
     }
 
+    // Whether the effort setting for the request's model differs from when it was sent.
+    async function effortChanged(seen: Last): Promise<boolean> {
+      if (seen.effortSig === undefined) return false
+      const env = await $.env.get('CLAUDE_CODE_EFFORT_LEVEL')
+      return effortSig(await $.settings.read(), env, seen.model) !== seen.effortSig
+    }
+
+    // An effort change turns keep-alive off (the next turn rewrites the cache anyway);
+    // the person turns it on again when they want it. Checked every minute while idle.
+    async function watchEffort() {
+      if (!(await follow())) return
+      if (!isOn || isBusy || isCompacting || !last) return
+      const [s0, g, seen] = [sid, gen, last]
+      if (!(await effortChanged(seen))) return
+      // Nothing may have moved while the settings were read.
+      if (sid !== s0 || gen !== g || last !== seen || !isOn || isBusy || isCompacting) return
+      await disable(EFFORT_CHANGED)
+      await publish()
+    }
+
     // Takes the cross-session lock: write a token of our own, wait a moment, and
     // only hold it if it is still ours (the store has no compare-and-set).
     async function takeLock(): Promise<Lock | undefined> {
@@ -387,10 +439,7 @@ export const register: Register = on => {
       if (now - anchor > STALE) return '缓存可能已过期，本次不续'
       const model = await $.session.model()
       if (!sameModel(model, seen.model)) return `模型已切换（${seen.model} → ${model}），本次不续`
-      if (seen.effortSig !== undefined) {
-        const sig = effortSig(await $.settings.read(), await $.env.get('CLAUDE_CODE_EFFORT_LEVEL'), model)
-        if (sig !== seen.effortSig) return '思考等级（effort）已改，下一轮本来就要重写缓存，本次不续'
-      }
+      if (await effortChanged(seen)) return EFFORT_CHANGED
       const quota = await quotaFull()
       if (quota) return `${quota}，本次不续`
       const ttl = await ttlProblem()
@@ -400,7 +449,7 @@ export const register: Register = on => {
 
     async function fire(kind: Kind, isManual = false, isRetry = false) {
       if (!isManual) timer = undefined
-      await follow()
+      if (!(await follow())) return
       if (!isManual && isFused) return publish()
       const g = gen
       const fireSid = sid
@@ -410,6 +459,10 @@ export const register: Register = on => {
       const seen = last
       anchor = Math.max(anchor, seen.at) // the last real request touched the cache too
       const early = await blocker(isManual, seen)
+      if (early === EFFORT_CHANGED) {
+        if (gen === g && sid === fireSid) await disable(EFFORT_CHANGED)
+        return publish()
+      }
       if (early !== undefined) {
         if (early && !isManual) await stopStretch(early)
         else if (early) note = early
@@ -437,6 +490,10 @@ export const register: Register = on => {
       try {
         // Last look: nothing may have moved while the checks and the lock were awaited.
         const late = await blocker(isManual, seen)
+        if (late === EFFORT_CHANGED) {
+          if (gen === g && sid === fireSid) await disable(EFFORT_CHANGED)
+          return publish()
+        }
         if (gen !== g || late !== undefined) {
           if (late && !isManual && gen === g) await stopStretch(late)
           else if (late) note = late
@@ -568,7 +625,7 @@ export const register: Register = on => {
 
     // `/keepalive now`: one refresh right away, outside the schedule.
     async function refreshNow(): Promise<string> {
-      await follow()
+      if (!(await follow())) return '会话正在切换，请稍后再试。'
       if (!last) return '这个会话还没有可续的请求：先完成一轮对话。'
       if (isBusy) return '正在对话中，缓存本来就是热的。'
       if (last.cached < MIN_PREFIX) return `上下文 ${kTok(last.cached)} < ${kTok(MIN_PREFIX)}，不值得续。`
@@ -597,7 +654,7 @@ export const register: Register = on => {
     api = { save, publish, arm, list, cost, now: refreshNow, offOther, ttlProblem, follow, disable, followSoon }
     home = (await $.env.get('HOME')) ?? ''
     showStatus = (await $.env.get('CACHE_KEEPALIVE_UI_STATUS')) !== '0'
-    await load(await $.session.id())
+    await load(await $.session.id()) // false: superseded; the state stays off until the next follow()
 
     // Forget records of sessions not seen for three days; `last:`/`busy:` keys go by
     // their own time. An `off:` tombstone stays until its session has taken it in
@@ -624,11 +681,14 @@ export const register: Register = on => {
       argumentHint: 'on [次数|8h] | max | now | off [会话id] | status | list',
     })
     await resume()
+    $.clock.every(EFFORT_EVERY, () => {
+      void watchEffort().catch(() => undefined)
+    })
     return r
   })
 
   on('command.run', { command: 'keepalive' }, async ($, e) => {
-    await api?.follow()
+    if (api && !(await api.follow())) return { text: '会话正在切换，请稍后再试。' }
     let [verb = 'status', param = ''] = e.args.trim().toLowerCase().split(/\s+/)
     // `/keepalive 5` or `/keepalive 8h` means `on` with that cap.
     if (verb && parseCap(verb) !== undefined) [verb, param] = ['on', verb]
@@ -684,10 +744,15 @@ export const register: Register = on => {
   })
 
   on('turn.start', async ($, e, next) => {
-    await api?.follow()
+    // Stopping timers and marking busy is safe whatever session the state is for.
+    isTurnActive = true
     isBusy = true
     gen += 1
     cancel()
+    // A failure here leaves the flags set on purpose: if the turn runs anyway, clearing
+    // them could let a ping out mid-turn. The next turn's completion clears them.
+    if (api && !(await api.follow())) return next(e)
+    isBusy = true // a load committed by follow() starts from a clean state
     if (isOn) await $.store.set(`busy:${sid}`, { at: await $.clock.now() })
     // Back after a fork went out for it, or past its time: the one-off cap was for that absence.
     if (capUntil && (hasForked || (await $.clock.now()) > capUntil)) {
@@ -737,10 +802,18 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
-    const r = await next(e)
+    let r
+    try {
+      r = await next(e)
+    } finally {
+      if (e.agentId === undefined) {
+        // Cleared whatever happens in the chain, or a stuck flag would end keep-alive silently.
+        isTurnActive = false
+        isBusy = false
+        await $.store.delete(`busy:${sid}`).catch(() => undefined)
+      }
+    }
     if (e.agentId === undefined) {
-      isBusy = false
-      await $.store.delete(`busy:${sid}`)
       if (e.reason === 'answer') await api?.arm()
       else {
         cancel()

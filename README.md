@@ -86,7 +86,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 - **距上次触碰缓存超过 57 分钟**：跳过。
 - **上下文 < 50k**：不续（重建本来就便宜）。
 - **正在对话、刚压缩、换了模型、上一轮被中断**：不续，等下一轮正常结束再计时。
-- **改了思考等级（effort）**：不续。插件按 Claude Code 的优先级（`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<模型>.effortLevel` → `effortLevel`）取请求发出时生效的那一个值，续命前再取一次，不同就停。只在当前会话生效、没写进设置或环境变量的改动检测不到；从"未设置"改成显式写上模型默认值，会被当作改动（只会少续，不会多花钱）。
+- **改了思考等级（effort）**：**自动关闭续命**（空闲时每分钟检查一次，续命前也会再查），状态行的 ♻ 随之消失；需要时手动 `/keepalive on` 重新开启。插件按 Claude Code 的优先级（`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<模型>.effortLevel` → `effortLevel`）取请求发出时生效的那一个值，之后再取，不同就关闭。只在当前会话生效、没写进设置或环境变量的改动检测不到；从"未设置"改成显式写上模型默认值，会被当作改动（只会少续，不会多花钱）。
 - **5 小时或 7 天额度 ≥ 95%**：跳过。
 - **单次输出 > 100 token**：本次离开不再续（`$.model.fork` 不支持设置 max_tokens，只能事后熔断）。
 - **多窗口**：用共享锁尽量让同一时间只有一个会话在续，其他错开 20–50 秒、只重试一次。存储不支持原子操作，极少数情况下两个会话可能同时发出；两次都是各自本来就要续的，不会多花钱。
@@ -121,7 +121,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 ### 中途改模型或思考等级
 
-缓存按模型分开存，换模型后整个缓存作废；改 effort 会让对话历史部分的缓存作废（Claude Code 目前把 effort 作为请求顶层参数发送，没有使用 API 里"按消息改 effort、不破坏缓存"的 beta）。所以改完后的下一句话一定会重写一次缓存，与是否续命无关。建议在新任务开始、上下文还小时改，或者改完立刻接着聊；不要改完就离开。插件检测到设置或环境变量里的改动后会停止本次续命；纯会话级的改动它看不到，这种情况请手动 `/keepalive off`。
+缓存按模型分开存，换模型后整个缓存作废；改 effort 会让对话历史部分的缓存作废（Claude Code 目前把 effort 作为请求顶层参数发送，没有使用 API 里"按消息改 effort、不破坏缓存"的 beta）。所以改完后的下一句话一定会重写一次缓存，与是否续命无关。建议在新任务开始、上下文还小时改，或者改完立刻接着聊；不要改完就离开。插件检测到设置或环境变量里的改动后会自动关闭续命（♻ 消失），之后由你决定何时 `/keepalive on`；纯会话级的改动它看不到，这种情况请手动 `/keepalive off`。
 
 ### 什么时候不该用
 
@@ -206,7 +206,7 @@ These checks are re-run right before a request goes out; they are best effort, n
 - **> 57 min since the cache was last touched**: skipped.
 - **Context < 50k tokens**: not refreshed (rebuilding is cheap).
 - **Turn in progress, just compacted, model changed, last turn interrupted**: not refreshed until the next normal turn.
-- **Effort changed**: not refreshed. The plugin takes the effort value that wins in Claude Code's order (`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<model>.effortLevel` → `effortLevel`) when the request leaves, and again before a refresh; a difference stops it. A change made for the session only, never written to settings or the environment, is not seen; going from unset to writing the model's default explicitly counts as a change (fewer refreshes, never more spend).
+- **Effort changed**: **keep-alive turns itself off** (checked every minute while idle and again before a refresh), the ♻ disappears from the status line; run `/keepalive on` when you want it back. The plugin takes the effort value that wins in Claude Code's order (`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<model>.effortLevel` → `effortLevel`) when the request leaves, and again later; a difference turns it off. A change made for the session only, never written to settings or the environment, is not seen; going from unset to writing the model's default explicitly counts as a change (fewer refreshes, never more spend).
 - **5-hour or 7-day quota ≥ 95%**: skipped.
 - **Output > 100 tokens** in one refresh: no more refreshes that absence (`$.model.fork` takes no max_tokens).
 - **Several windows**: a shared lock tries to keep one fork at a time; others retry once 20–50 s later. The store has no atomic write, so on rare occasions two sessions may send at once; each was due anyway, so it costs nothing extra.
@@ -228,7 +228,7 @@ For your own status line script, read `~/.cache/claude-cache-keepalive/<session_
 
 ### Switching model or effort mid-session
 
-Caches are per model, so a model switch drops the whole cache; an effort change drops the conversation's part of it (Claude Code currently sends effort as a top-level request parameter, not through the API's per-message effort beta that keeps the cache). The next message after such a change rewrites the cache whether or not keep-alive is on. Change them early in a task, or keep chatting right after; don't change and walk away. The plugin stops refreshing once it sees the change in settings or the environment; a session-only change is invisible to it, so run `/keepalive off` yourself in that case.
+Caches are per model, so a model switch drops the whole cache; an effort change drops the conversation's part of it (Claude Code currently sends effort as a top-level request parameter, not through the API's per-message effort beta that keeps the cache). The next message after such a change rewrites the cache whether or not keep-alive is on. Change them early in a task, or keep chatting right after; don't change and walk away. The plugin turns keep-alive off once it sees the change in settings or the environment (the ♻ disappears) and leaves turning it on again to you; a session-only change is invisible to it, so run `/keepalive off` yourself in that case.
 
 ### When not to use it
 
