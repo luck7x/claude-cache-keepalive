@@ -6,7 +6,8 @@ import type { Register, Timer } from 'claude-code'
 // cache would lapse. Off until `/keepalive on`. Every doubt stops it:
 // a first "canary" fork must show the cache was read, not rewritten; a timer that
 // fires late (the machine slept), a turn in progress, a compaction or a model
-// change all skip; any miss ends the idle stretch.
+// change all skip; any miss ends the idle stretch. While it is on, Claude Code's idle
+// compaction is held back for that session (the two are exclusive).
 
 const MIN = 60_000
 const DAY = 24 * 60 * MIN
@@ -924,6 +925,21 @@ export const register: Register = on => {
 
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
+    // Idle compaction (Claude Code's own, between turns, shortly before the cache lapses)
+    // and keep-alive are opposite answers to the same absence: with keep-alive on, the
+    // cache is kept instead. It comes as trigger 'auto' with empty instructions and no
+    // turn running; /compact ('manual'), a full context (inside a turn) and the
+    // background precompute ('precompute') all go ahead.
+    // After /resume the state may still be the old session's: catch up first, and let
+    // the compaction run when that fails. A status write never decides it.
+    if (e.trigger === 'auto' && e.instructions === '' && !isTurnActive) {
+      const isCurrent = api ? await api.follow().catch(() => false) : true
+      if (isCurrent && isOn && !isTurnActive) {
+        note = '已拦下空闲压缩（续命开着）'
+        await api?.publish().catch(() => undefined)
+        return { skip: '缓存续命开着，不做空闲压缩' }
+      }
+    }
     isCompacting = true
     gen += 1
     cancel()

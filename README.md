@@ -37,7 +37,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
   ```
 
   不是 1h 时，插件会拒绝开启并说明原因。
-- 由组织统一管理的 Claude Code 中，个人安装的插件收不到压缩（compact）事件；插件仍会在下一轮请求后重新计时，但请知悉。
+- 由组织统一管理的 Claude Code 中，个人安装的插件收不到压缩（compact）事件：插件拦不下空闲压缩，但仍会在下一轮请求后重新计时。
 
 ### 安装
 
@@ -87,6 +87,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 - **上下文 < 50k**：不续（重建本来就便宜）。
 - **正在对话、刚压缩、换了模型、上一轮被中断**：不续，等下一轮正常结束再计时。
 - **改了思考等级（effort）**：**续命暂停**并弹出提示，状态行的 ♻ 消失；**改回原来的 effort 会自动恢复**（♻ 重新出现）；按新 effort 发一条消息，则重写一次缓存后按新 effort 续命。空闲时每 2 秒检查一次，`/effort`、`/model` 之后立即检查，续命前也会再查。插件按 Claude Code 的优先级（`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<模型>.effortLevel` → `effortLevel`）取请求发出时生效的那一个值，之后再取，不同就暂停、相同就恢复。只在当前会话生效、没写进设置或环境变量的改动检测不到；从"未设置"改成显式写上模型默认值，会被当作改动（只会少续，不会多花钱）。
+- **与空闲压缩互斥**：Claude Code 2.1.299 起会在你离开约 54 分钟、缓存过期前自动压缩较长的对话（空闲压缩）。它看不到续命请求，压缩后续命就白做了。所以**开着续命的会话里，插件会拦下空闲压缩**，`/keepalive status` 会显示"已拦下空闲压缩"；关掉续命后恢复。手动 `/compact` 和上下文满了的自动压缩不受影响。想让所有会话都不做空闲压缩，可以在 `~/.claude/settings.json` 里加 `"idleCompaction": false`。
 - **5 小时或 7 天额度 ≥ 95%**：跳过。
 - **单次输出 > 100 token**：本次离开不再续（`$.model.fork` 不支持设置 max_tokens，只能事后熔断）。
 - **多窗口**：用共享锁尽量让同一时间只有一个会话在续，其他错开 20–50 秒、只重试一次。存储不支持原子操作，极少数情况下两个会话可能同时发出；两次都是各自本来就要续的，不会多花钱。
@@ -166,7 +167,7 @@ Measured on Opus 5.5 with ~300k context: 319k read from cache, 0 written, 3 outp
   ```
 
   The plugin refuses to turn on otherwise and says why.
-- Where an organization manages Claude Code, plugins a person installs do not receive the compaction event; the plugin still re-arms after the next request.
+- Where an organization manages Claude Code, plugins a person installs do not receive the compaction event: idle compaction cannot be held back, though the plugin still re-arms after the next request.
 
 ### Install
 
@@ -207,6 +208,7 @@ These checks are re-run right before a request goes out; they are best effort, n
 - **Context < 50k tokens**: not refreshed (rebuilding is cheap).
 - **Turn in progress, just compacted, model changed, last turn interrupted**: not refreshed until the next normal turn.
 - **Effort changed**: **keep-alive pauses** with a notice and the ♻ disappears; **setting effort back resumes it** (the ♻ returns); sending a message at the new effort rewrites the cache once and keep-alive carries on at that effort. Checked every 2 seconds while idle, right after `/effort` and `/model`, and again before a refresh. The plugin takes the effort value that wins in Claude Code's order (`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<model>.effortLevel` → `effortLevel`) when the request leaves, and again later; a difference pauses it, a match resumes it. A change made for the session only, never written to settings or the environment, is not seen; going from unset to writing the model's default explicitly counts as a change (fewer refreshes, never more spend).
+- **Exclusive with idle compaction**: from Claude Code 2.1.299, a long conversation is compacted about 54 minutes into an absence, before its cache lapses (idle compaction). It does not see keep-alive's refreshes, so compacting throws them away. **In a session with keep-alive on, the plugin holds idle compaction back** (`/keepalive status` says so); turning keep-alive off lets it run again. `/compact` and compaction at a full context are untouched. To stop idle compaction in every session, add `"idleCompaction": false` to `~/.claude/settings.json`.
 - **5-hour or 7-day quota ≥ 95%**: skipped.
 - **Output > 100 tokens** in one refresh: no more refreshes that absence (`$.model.fork` takes no max_tokens).
 - **Several windows**: a shared lock tries to keep one fork at a time; others retry once 20–50 s later. The store has no atomic write, so on rare occasions two sessions may send at once; each was due anyway, so it costs nothing extra.
