@@ -39,7 +39,10 @@ const PROMPT =
   'Cache keep-alive ping. This needs no reasoning: do not think, do not use tools. Reply with exactly "." and nothing else.'
 
 type Kind = 'canary' | 'ping'
-type Last = { at: number; cached: number; model: string }
+// `effortSig` is what the settings said about effort when the request was made; a
+// different one later means effort was changed (Claude Code renders effort into the
+// request, so the next turn rewrites the conversation's cache and a refresh is wasted).
+type Last = { at: number; cached: number; model: string; effort?: string | number; effortSig?: string }
 type Row = {
   sid?: string
   cwd?: string
@@ -129,13 +132,37 @@ const fmtMin = (ms: number) => {
   const m = Math.max(0, Math.round(ms / MIN))
   return m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m` : `${m}m`
 }
-// "claude-opus-5-5[1m]" and "claude-opus-5-5-20261001" are "claude-opus-5-5" here.
-const modelKey = (m: string) =>
-  m
-    .toLowerCase()
-    .replace(/\[.*?\]/g, '')
+// The family name, for looking up settings and prices only (never for safety
+// checks: it drops the date). One canonical name for every spelling of a model: "claude-opus-5-5[1m]",
+// "claude-opus-5-5-20261001", Bedrock's "us.anthropic.claude-opus-5-5-v1:0" and
+// Vertex's "claude-opus-5-5@20261001" are all "claude-opus-5-5" here.
+const modelKey = (m: string) => {
+  const s = m.toLowerCase().replace(/\[.*?\]/g, '')
+  const at = s.indexOf('claude-')
+  return (at > 0 ? s.slice(at) : s)
+    .replace(/@.*$/, '')
+    .replace(/-v\d+(:\d+)?$/, '')
     .replace(/-\d{8}$/, '')
-const sameModel = (a: string, b: string) => modelKey(a) === modelKey(b)
+}
+// For "is this the same model?": provider wrappers go, but the date stays, so two
+// dated versions of one family never compare equal (Vertex's "@date" = "-date").
+const modelId = (m: string) => {
+  const s = m.toLowerCase().replace(/\[.*?\]/g, '')
+  const at = s.indexOf('claude-')
+  return (at > 0 ? s.slice(at) : s).replace('@', '-').replace(/-v\d+(:\d+)?$/, '')
+}
+const sameModel = (a: string, b: string) => modelId(a) === modelId(b)
+
+// The effort setting that wins for a model, in Claude Code's order: the env override,
+// then the model's own setting, then the global one (null: the model's default).
+// A change to a setting another one shadows does not count.
+function effortSig(settings: Readonly<Record<string, unknown>>, env: string | undefined, model: string): string {
+  const per = settings.modelSettings as Record<string, { effortLevel?: unknown } | undefined> | undefined
+  const own = per
+    ? Object.entries(per).find(([k]) => modelKey(k) === modelKey(model))?.[1]?.effortLevel
+    : undefined
+  return JSON.stringify(env || own || settings.effortLevel || null)
+}
 
 function cancel() {
   timer?.cancel()
@@ -360,6 +387,10 @@ export const register: Register = on => {
       if (now - anchor > STALE) return '缓存可能已过期，本次不续'
       const model = await $.session.model()
       if (!sameModel(model, seen.model)) return `模型已切换（${seen.model} → ${model}），本次不续`
+      if (seen.effortSig !== undefined) {
+        const sig = effortSig(await $.settings.read(), await $.env.get('CLAUDE_CODE_EFFORT_LEVEL'), model)
+        if (sig !== seen.effortSig) return '思考等级（effort）已改，下一轮本来就要重写缓存，本次不续'
+      }
       const quota = await quotaFull()
       if (quota) return `${quota}，本次不续`
       const ttl = await ttlProblem()
@@ -487,7 +518,7 @@ export const register: Register = on => {
 
     // Cache-read price per MTok, for the cost estimate only.
     function readPrice(model: string): number | undefined {
-      const key = Object.keys(CACHE_READ_PRICE).find(k => sameModel(model, k))
+      const key = Object.keys(CACHE_READ_PRICE).find(k => modelKey(model) === modelKey(k))
       return key ? CACHE_READ_PRICE[key] : undefined
     }
 
@@ -669,12 +700,36 @@ export const register: Register = on => {
   })
 
   on('turn.step', async function* ($, e, next) {
+    // Decided before any await: our own fork runs while no turn does; a real turn's
+    // steps always count, even if a turn starts while this step is in flight.
+    const isMain = e.agentId === undefined && !(isForking && !isBusy)
+    if (!isMain) return yield* next(e)
     const start = await $.clock.now()
+    // The effort settings as the request leaves, not as they are once it is answered.
+    let sig: string | undefined
+    try {
+      const [settings, envEffort] = await Promise.all([$.settings.read(), $.env.get('CLAUDE_CODE_EFFORT_LEVEL')])
+      sig = effortSig(settings, envEffort, e.model)
+    } catch {
+      sig = undefined // unknown: this request must not be refreshed (below)
+    }
     const r = yield* next(e)
-    // Our own fork runs while no turn does; a real turn's steps always count.
-    if (e.agentId === undefined && !(isForking && !isBusy) && r && r.usage) {
+    if (sig === undefined) {
+      // Without the settings this request went out with, a change could not be seen:
+      // forget the last request whether or not this one was answered.
+      last = undefined
+      if (isOn) await $.store.delete(`last:${sid}`)
+      return r
+    }
+    if (r && r.usage) {
       const u = r.usage
-      last = { at: start, cached: u.cache_read_input_tokens + u.cache_creation_input_tokens, model: e.model }
+      last = {
+        at: start,
+        cached: u.cache_read_input_tokens + u.cache_creation_input_tokens,
+        model: e.model,
+        effort: e.effort,
+        effortSig: sig,
+      }
       // Kept across reloads of the mod, for sessions with keep-alive on only.
       if (isOn) await $.store.set(`last:${sid}`, last)
     }
