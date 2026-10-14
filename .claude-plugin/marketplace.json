@@ -1,0 +1,16 @@
+{
+  "name": "claude-cache-keepalive",
+  "owner": {
+    "name": "luck7x"
+  },
+  "plugins": [
+    {
+      "name": "cache-keepalive",
+      "source": "./",
+      "description": "Keep Claude Code's prompt cache warm while you are away, cheaply and safely."
+    }
+  ],
+  "metadata": {
+    "description": "Prompt-cache keep-alive mod for Claude Code."
+  }
+}
