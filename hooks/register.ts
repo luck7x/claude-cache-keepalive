@@ -385,7 +385,11 @@ export const register: Register = on => {
       const [g0, id] = [gen, sid] // the stretch this call is for; a turn or switch ends it
       pings = 0
       isFused = false
-      if (!(await synced()) || !last) return publish()
+      if (!(await synced())) return publish()
+      if (!last) {
+        note = '先在这个会话发一条消息，之后开始计时续命'
+        return publish()
+      }
       if (last.cached < MIN_PREFIX) {
         note = `上下文 ${kTok(last.cached)} < ${kTok(MIN_PREFIX)}，不续`
         return publish()
@@ -653,7 +657,9 @@ export const register: Register = on => {
       const at = sent
       if (!r.isAnswered && r.reason === 'nothing-to-fork') {
         hasForked = false // no request was made
-        note = '没有可续的主会话请求'
+        // Claude Code keeps what a fork replays in memory, per session: after a restart
+        // or a /resume it exists only once this session has made a request here.
+        note = '重启或 /resume 后还没发过消息：先发一条消息才能续命'
         await save()
         return publish()
       }
@@ -732,7 +738,7 @@ export const register: Register = on => {
         .map(r => {
           const me = r.sid === sid ? '（本会话）' : ''
           const state = !r.next
-            ? r.note || '等待下一轮结束'
+            ? r.note || (r.cached ? '等待本轮结束' : '先在该会话发一条消息，之后开始续命')
             : r.next < now - LATE
               ? '已失联（窗口可能已关闭）'
               : `${r.nextKind === 'canary' ? '验证' : '续命'}在 ${fmtMin(r.next - now)} 后`
@@ -945,7 +951,8 @@ export const register: Register = on => {
         effort: e.effort,
         effortSig: sig,
       }
-      // Kept across reloads of the mod, for sessions with keep-alive on only.
+      // Kept across reloads of the mod, for sessions with keep-alive on only. A new
+      // process can't use it: $.model.fork needs a main request made in this process.
       if (isOn) await $.store.set(`last:${sid}`, last)
     }
     return r

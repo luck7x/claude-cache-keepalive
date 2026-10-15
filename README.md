@@ -94,6 +94,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 - **单次输出 > 100 token**：本次离开不再续（`$.model.fork` 不支持设置 max_tokens，只能事后熔断）。
 - **多窗口**：用共享锁尽量让同一时间只有一个会话在续，其他错开 20–50 秒、只重试一次。存储不支持原子操作，极少数情况下两个会话可能同时发出；两次都是各自本来就要续的，不会多花钱。
 - **`/clear`、`/resume` 切换会话**：新会话不继承旧会话的开关和验证状态；`/clear` 会清掉旧会话的记录。
+- **重启 Claude Code 或 /resume 之后**：必须先在这个会话里发一条消息才能续命。续命请求复用的是 Claude Code 内存里"本进程最近一次主请求"，它不写盘，新进程或刚切换的会话里还没有；在这之前，状态里可能已经显示排好的续命，但到时间发出时会提示"先发一条消息"，不产生模型费用。
 - **上限为 0**（如 `/keepalive 1h`）：不验证也不续。临时上限（数字或时长）都会在它能撑到的时间过后自动失效，热重载也会保留它。
 - **Claude Code 热重载插件**：如果当时正在对话，等这一轮结束才重新计时；不在对话中则接着之前的计划续。
 - 关掉窗口，定时器随进程结束。
@@ -217,6 +218,7 @@ These checks are re-run right before a request goes out; they are best effort, n
 - **Output > 100 tokens** in one refresh: no more refreshes that absence (`$.model.fork` takes no max_tokens).
 - **Several windows**: a shared lock tries to keep one fork at a time; others retry once 20–50 s later. The store has no atomic write, so on rare occasions two sessions may send at once; each was due anyway, so it costs nothing extra.
 - **`/clear`, `/resume`**: a new conversation inherits neither the switch nor the canary of the old one; `/clear` deletes the old one's records.
+- **After restarting Claude Code or a /resume**: send one message in that session before anything can be refreshed. A refresh replays Claude Code's in-memory copy of this process's last main request, which is never written to disk, so a new process or a just-switched session has none yet; until then a refresh may show as scheduled, but when it is due it only says to send a message, at no model cost.
 - **Cap 0** (e.g. `/keepalive 1h`): no canary, no refresh. A one-off cap (count or time) lapses when the cache it buys would, and survives a reload of the mod.
 - **A reload of the mod**: mid-turn, it waits for the turn to end; otherwise it carries on with the schedule.
 - Closing the window ends its timers.
