@@ -24,7 +24,8 @@ const READ_OK = 0.9 // fork must read at least this share of the cached prefix
 const WRITE_MAX = 0.1 // and write at most this share of it
 const LOCK_MS = 90_000 // one fork at a time across sessions
 const QUOTA_STOP = 95 // skip pings once a 5h / 7d window is this full (%)
-const OUTPUT_MAX = 100 // a fork that writes more than this is not a cheap ping
+const OUTPUT_MAX = 200 // a fork that writes more than this (thinking included) is not a cheap ping
+const OVERRUN_MAX = 3 // the third such reply in one absence stops it; the first two carry on
 const FORGET_AFTER = 3 * DAY // store records of sessions not seen for this long
 const EFFORT_EVERY = 2_000 // how often an idle session looks for an effort change (a local read)
 const EFFORT_CHANGED = 'effort-changed' // blocker's answer: pause, don't stop
@@ -40,7 +41,8 @@ const CACHE_READ_PRICE: Record<string, number> = {
   'claude-sonnet-5-5': 0.1,
   'claude-haiku-5-5': 0.01,
 }
-// $.model.fork takes no output cap, so the prompt keeps the reply short and OUTPUT_MAX stops the stretch.
+// $.model.fork takes no output cap (nor thinking or effort settings: it replays the main
+// thread's), so the prompt keeps the reply short and OUTPUT_MAX / OVERRUN_MAX stop the stretch.
 const PROMPT =
   'Cache keep-alive ping. This needs no reasoning: do not think, do not use tools. Reply with exactly "." and nothing else.'
 
@@ -80,6 +82,7 @@ type Saved = {
   pings?: number
   isFused?: boolean // this idle stretch was stopped: no more pings until a real turn
   hasForked?: boolean // a fork went out since the cap was set
+  overruns?: number // refreshes this stretch whose output passed OUTPUT_MAX
 }
 
 type Api = {
@@ -124,6 +127,7 @@ let anchor = 0 // last time the cache was confirmed touched
 let refreshedAt = 0 // last successful fork, for status lines' countdowns
 let pings = 0
 let isFused = false
+let overruns = 0 // refreshes this absence whose output passed OUTPUT_MAX
 let hasForked = false
 // Effort now differs from the last request's: no refresh (the cache it would keep
 // can't be used at this effort) until it is set back, or a turn runs at the new one.
@@ -224,6 +228,7 @@ function forgetSession() {
   refreshedAt = 0
   pings = 0
   isFused = false
+  overruns = 0
   hasForked = false
   isPaused = false
   pausedFrom = ''
@@ -241,7 +246,7 @@ export const register: Register = on => {
       // Session and fields as they are now: a switch during the awaits must not mix them.
       // Queued, so an older save (a default-on) never lands after a newer one (an off).
       const id = sid
-      const v: Saved = { isOn, isVerified, at: 0, base, max, capUntil, anchor, pings, isFused, hasForked }
+      const v: Saved = { isOn, isVerified, at: 0, base, max, capUntil, anchor, pings, isFused, hasForked, overruns }
       return queued(async () => {
         v.at = await $.clock.now()
         await $.store.set(`on:${id}`, v)
@@ -332,6 +337,7 @@ export const register: Register = on => {
       refreshedAt = anchor > (last?.at ?? 0) ? anchor : 0
       pings = saved?.pings ?? 0
       isFused = saved?.isFused ?? false
+      overruns = saved?.overruns ?? 0
       hasForked = saved?.hasForked ?? false
       // A reload can land mid-turn: the turn's own marker says so.
       isBusy = isTurnActive || (busy !== undefined && now - busy.at < BUSY_FOR)
@@ -432,6 +438,7 @@ export const register: Register = on => {
       const [g0, id] = [gen, sid] // the stretch this call is for; a turn or switch ends it
       pings = 0
       isFused = false
+      overruns = 0
       if (!(await synced())) return publish()
       if (!last) {
         note = '先在这个会话发一条消息，之后开始计时续命'
@@ -743,11 +750,17 @@ export const register: Register = on => {
         pings += 1
         note = `第${pings}次续命（${spent}）`
       }
+      // The cache was kept, but a reply over OUTPUT_MAX cost real output (the model thought,
+      // which the prompt can't forbid). Counted before the save, so a reload keeps the count.
+      if (out > OUTPUT_MAX) overruns += 1
       await save()
       if (out > OUTPUT_MAX) {
-        // The cache was kept, but this ping cost real output: no more this stretch.
-        await stopStretch(`${note}，输出 ${out} token 超过 ${OUTPUT_MAX}，本次熔断`)
-        return publish()
+        // Carry on as planned; the OVERRUN_MAX-th time ends the stretch.
+        if (overruns >= OVERRUN_MAX) {
+          await stopStretch(`${note}，输出 ${out} token 超过 ${OUTPUT_MAX}（本次离开第 ${overruns} 次），本次熔断`)
+          return publish()
+        }
+        note += `，输出 ${out} token 超过 ${OUTPUT_MAX}（本次离开第 ${overruns}/${OVERRUN_MAX} 次），继续`
       }
       if (isBusy || !isOn || isFused) return publish()
       if (kind === 'canary' ? max > 0 : pings < max)
@@ -895,6 +908,7 @@ export const register: Register = on => {
       isOn = true
       isDefaultPending = false
       isFused = false
+      overruns = 0
       hasForked = false
       if (verb === 'max') base = MAX_CAP
       else if (!param) base = MAX_PINGS // plain `on` is the normal mode
