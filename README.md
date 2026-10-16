@@ -53,7 +53,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 默认**关闭**，按会话开启，每个窗口各自独立。
 
-想让新会话自动开启（普通模式，每次离开最多续 2 次），在 `~/.claude/settings.json` 的 `env` 里加 `"CACHE_KEEPALIVE_DEFAULT": "on"`。只对交互式窗口生效（`claude -p` 和 SDK 不会自动开启）；你对某个会话执行过 `/keepalive off`（包括从别的窗口关闭）后，它一直保持关闭，直到你再 `/keepalive on`。
+想让新会话自动开启（普通模式，每次离开最多续 2 次），在 `~/.claude/settings.json` 的 `env` 里加 `"CACHE_KEEPALIVE_DEFAULT": "on"`。会话在**第一轮对话结束后**才开启，只打开没说话的窗口不会开启、也不留记录。只对交互式窗口生效（`claude -p` 和 SDK 不会自动开启）；你对某个会话执行过 `/keepalive off`（包括从别的窗口关闭）后，它一直保持关闭，直到你再 `/keepalive on`。
 
 | 命令 | 作用 |
 |---|---|
@@ -94,7 +94,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 - **单次输出 > 100 token**：本次离开不再续（`$.model.fork` 不支持设置 max_tokens，只能事后熔断）。
 - **多窗口**：用共享锁尽量让同一时间只有一个会话在续，其他错开 20–50 秒、只重试一次。存储不支持原子操作，极少数情况下两个会话可能同时发出；两次都是各自本来就要续的，不会多花钱。
 - **`/clear`、`/resume` 切换会话**：新会话不继承旧会话的开关和验证状态；`/clear` 会清掉旧会话的记录。
-- **重启 Claude Code 或 /resume 之后**：必须先在这个会话里发一条消息才能续命。续命请求复用的是 Claude Code 内存里"本进程最近一次主请求"，它不写盘，新进程或刚切换的会话里还没有；在这之前，状态里可能已经显示排好的续命，但到时间发出时会提示"先发一条消息"，不产生模型费用。
+- **重启 Claude Code 或 /resume 之后**：必须先在这个会话里发一条消息才能续命。续命请求复用的是 Claude Code 内存里"本进程最近一次主请求"，它不写盘，新进程或刚切换的会话里还没有；在这之前状态行不显示 ♻，`/keepalive list` 也不列出它（`/keepalive status` 会说明在等第一条消息），不发请求、不花钱。
 - **上限为 0**（如 `/keepalive 1h`）：不验证也不续。临时上限（数字或时长）都会在它能撑到的时间过后自动失效，热重载也会保留它。
 - **Claude Code 热重载插件**：如果当时正在对话，等这一轮结束才重新计时；不在对话中则接着之前的计划续。
 - 关掉窗口，定时器随进程结束。
@@ -186,7 +186,7 @@ Answer `y` to add the marketplace, pick a scope (user is recommended). It is act
 
 Off by default; enabled per session, each window on its own.
 
-To have new sessions start on (normal mode, up to 2 refreshes per absence), add `"CACHE_KEEPALIVE_DEFAULT": "on"` to the `env` block of `~/.claude/settings.json`. Interactive windows only (`claude -p` and the SDK never start on); a session you turned off with `/keepalive off` (also from another window) stays off until `/keepalive on`.
+To have new sessions start on (normal mode, up to 2 refreshes per absence), add `"CACHE_KEEPALIVE_DEFAULT": "on"` to the `env` block of `~/.claude/settings.json`. A session turns on **after its first turn**; a window opened and never used is not turned on and leaves no record. Interactive windows only (`claude -p` and the SDK never start on); a session you turned off with `/keepalive off` (also from another window) stays off until `/keepalive on`.
 
 | Command | Effect |
 |---|---|
@@ -218,7 +218,7 @@ These checks are re-run right before a request goes out; they are best effort, n
 - **Output > 100 tokens** in one refresh: no more refreshes that absence (`$.model.fork` takes no max_tokens).
 - **Several windows**: a shared lock tries to keep one fork at a time; others retry once 20–50 s later. The store has no atomic write, so on rare occasions two sessions may send at once; each was due anyway, so it costs nothing extra.
 - **`/clear`, `/resume`**: a new conversation inherits neither the switch nor the canary of the old one; `/clear` deletes the old one's records.
-- **After restarting Claude Code or a /resume**: send one message in that session before anything can be refreshed. A refresh replays Claude Code's in-memory copy of this process's last main request, which is never written to disk, so a new process or a just-switched session has none yet; until then a refresh may show as scheduled, but when it is due it only says to send a message, at no model cost.
+- **After restarting Claude Code or a /resume**: send one message in that session before anything can be refreshed. A refresh replays Claude Code's in-memory copy of this process's last main request, which is never written to disk, so a new process or a just-switched session has none yet; until then the status line shows no ♻ and `/keepalive list` leaves it out (`/keepalive status` says it is waiting for a first message); nothing is sent and nothing is spent.
 - **Cap 0** (e.g. `/keepalive 1h`): no canary, no refresh. A one-off cap (count or time) lapses when the cache it buys would, and survives a reload of the mod.
 - **A reload of the mod**: mid-turn, it waits for the turn to end; otherwise it carries on with the schedule.
 - Closing the window ends its timers.

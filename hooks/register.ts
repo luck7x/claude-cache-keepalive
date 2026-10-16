@@ -86,6 +86,7 @@ type Api = {
   save: () => Promise<void>
   publish: () => Promise<void>
   arm: () => Promise<void>
+  adoptDefault: (g0: number, id: string) => Promise<void>
   list: () => Promise<string>
   cost: (n: number) => Promise<string>
   now: () => Promise<string>
@@ -112,6 +113,12 @@ let isBusy = false
 let isTurnActive = false
 let isCompacting = false
 let isForking = false
+// This process has sent a main request in this session: only then can a fork replay it,
+// so only then does keep-alive count as on for status lines and `/keepalive list`.
+let hasRequestHere = false
+// CACHE_KEEPALIVE_DEFAULT=on and nobody chose for this session yet: it turns on after
+// its first turn here, not on opening, so a window never used never shows as on.
+let isDefaultPending = false
 let last: Last | undefined
 let anchor = 0 // last time the cache was confirmed touched
 let refreshedAt = 0 // last successful fork, for status lines' countdowns
@@ -125,6 +132,16 @@ let pausedFrom = '' // the effort the cache was written at, for the messages
 let wasArmed = false // a refresh was due when the pause began: only then does a set-back resume it
 let publishing: Promise<void> = Promise.resolve() // publishes run one at a time, newest state last
 let saving: Promise<void> = Promise.resolve() // saves land in the order they were made
+
+// Every write of `on:`/`last:` goes through one queue, in the order made, so an older
+// value never lands after a newer one. Arguments are taken when queued, not when run.
+function queued(op: () => Promise<unknown>): Promise<void> {
+  const run = async () => {
+    await op()
+  }
+  saving = saving.then(run, run)
+  return saving
+}
 let timer: Timer | undefined
 let dueAt = 0
 let dueKind: Kind | undefined
@@ -212,6 +229,8 @@ function forgetSession() {
   pausedFrom = ''
   wasArmed = false
   note = ''
+  hasRequestHere = false
+  isDefaultPending = false
 }
 
 export const register: Register = on => {
@@ -223,12 +242,10 @@ export const register: Register = on => {
       // Queued, so an older save (a default-on) never lands after a newer one (an off).
       const id = sid
       const v: Saved = { isOn, isVerified, at: 0, base, max, capUntil, anchor, pings, isFused, hasForked }
-      const write = async () => {
+      return queued(async () => {
         v.at = await $.clock.now()
         await $.store.set(`on:${id}`, v)
-      }
-      saving = saving.then(write, write)
-      return saving
+      })
     }
 
     // Queued: each run reads the state when its turn comes, so the last one written is the newest.
@@ -241,13 +258,17 @@ export const register: Register = on => {
       if (!home || !sid) return
       // Fields and target taken together before any await, so a switch can't mix them.
       const id = sid
-      const ui = { isOn, isPaused, note, base, pings, max, isTimer: !!timer, dueAt, dueKind }
+      // On, and able to refresh in this process: a main request made here, or a refresh
+      // that worked here (after a mod reload). A timer alone proves nothing: in a new
+      // process it ends in nothing-to-fork.
+      const isLive = isOn && hasRequestHere
+      const ui = { isOn, isLive, isPaused, note, base, pings, max, isTimer: !!timer, dueAt, dueKind }
       const status: Row = {
         sid,
         cwd,
         model: last?.model,
         cached: last?.cached,
-        enabled: isOn,
+        enabled: isLive,
         verified: isVerified,
         pings,
         max,
@@ -263,7 +284,7 @@ export const register: Register = on => {
       if (!showStatus || sid !== id) return
       const isStopped = /未命中|出错|熔断|已关闭|被其他窗口/.test(ui.note)
       if (!ui.isOn) return $.ui.status(isStopped ? `♻✗ ${ui.note}` : undefined)
-      if (ui.isPaused) return $.ui.status(undefined)
+      if (ui.isPaused || !ui.isLive) return $.ui.status(undefined)
       const at = ui.isTimer ? new Date(ui.dueAt).toTimeString().slice(0, 5) : ''
       const mode = ui.base === MAX_CAP ? '常驻 ' : ''
       const upcoming = ui.isTimer ? ` · 下次${ui.dueKind === 'canary' ? '验证' : '续命'} ${at}` : ''
@@ -281,7 +302,8 @@ export const register: Register = on => {
         $.clock.now(),
       ])
       // Nobody chose for this session yet (no record, no off from another window):
-      // CACHE_KEEPALIVE_DEFAULT=on starts it in normal mode, interactive sessions only.
+      // CACHE_KEEPALIVE_DEFAULT=on turns it on in normal mode after its first turn here
+      // (adoptDefault), interactive sessions only.
       const isUnchosen = saved === undefined && isDefaultOn && isInteractive
       const isDefault =
         isUnchosen &&
@@ -297,7 +319,8 @@ export const register: Register = on => {
       forgetSession()
       sid = id
       cwd = dir
-      isOn = wasOn || isDefault
+      isOn = wasOn
+      isDefaultPending = isDefault && !wasOn
       isVerified = saved?.isVerified ?? false
       base = saved?.base ?? MAX_PINGS
       const isCapLive = saved?.max !== undefined && (saved.capUntil ?? 0) > now
@@ -312,8 +335,6 @@ export const register: Register = on => {
       hasForked = saved?.hasForked ?? false
       // A reload can land mid-turn: the turn's own marker says so.
       isBusy = isTurnActive || (busy !== undefined && now - busy.at < BUSY_FOR)
-      // Written now, so `/keepalive off <id>` from another window finds it before a turn.
-      if (isDefault) await save()
       return true
     }
 
@@ -342,15 +363,39 @@ export const register: Register = on => {
       await save()
     }
 
+    // The first turn here of a session nobody chose for, with CACHE_KEEPALIVE_DEFAULT=on:
+    // turn it on now, unless an off arrived meanwhile.
+    async function adoptDefault(g0: number, id: string) {
+      if (!isDefaultPending || gen !== g0 || sid !== id) return
+      const [off, optout, ttl] = await Promise.all([
+        $.store.get(`off:${id}`),
+        $.store.get(`optout:${id}`),
+        ttlProblem(),
+      ])
+      if (sid !== id || gen !== g0 || !isDefaultPending) return
+      isDefaultPending = false
+      if (isOn || off !== undefined || optout !== undefined || ttl) return
+      isOn = true
+      base = max = MAX_PINGS
+      // turn.step skipped `last:` while the session was off: keep this turn's for a reload,
+      // queued behind the save and only if nothing newer came (a request, an off, /clear).
+      const seen = last
+      await save()
+      await queued(async () => {
+        if (seen && gen === g0 && sid === id && isOn && last === seen) await $.store.set(`last:${id}`, seen)
+      })
+    }
+
     // Off for good, from any path: no timer, no fork in flight counts, no `last:` kept.
     async function disable(why: string) {
       const id = sid
       cancel()
       gen += 1
       isOn = false
+      isDefaultPending = false
       note = why
       await save()
-      await $.store.delete(`last:${id}`)
+      await queued(() => $.store.delete(`last:${id}`))
     }
 
     // `g0`/`id`: the generation and session the caller started in. A caller from an
@@ -656,6 +701,7 @@ export const register: Register = on => {
       if (gen !== g || sid !== fireSid) return publish()
       // Switched off from another window while the fork ran: that wins, nothing is saved over it.
       if (isOn && !(await synced())) return publish()
+      if (gen !== g || sid !== fireSid) return publish() // moved on during that check
       const at = sent
       if (!r.isAnswered && r.reason === 'nothing-to-fork') {
         hasForked = false // no request was made
@@ -674,6 +720,7 @@ export const register: Register = on => {
       const spent = `读${kTok(read)} 写${kTok(wrote)} 出${out}${reply}`
       const isHit = r.isAnswered && read >= READ_OK * seen.cached && wrote <= WRITE_MAX * seen.cached
 
+      if (r.isAnswered) hasRequestHere = true // the fork found this process's request: it can refresh
       if (!isHit) {
         cancel()
         if (kind === 'canary') {
@@ -729,7 +776,7 @@ export const register: Register = on => {
         if (!f.name.endsWith('.json')) continue
         try {
           const r = JSON.parse(await $.fs.read(`${statusDir()}/${f.name}`)) as Row
-          if (r.enabled || r.next) rows.push({ ...r, sid: r.sid ?? f.name.slice(0, -5) })
+          if (r.enabled) rows.push({ ...r, sid: r.sid ?? f.name.slice(0, -5) })
         } catch {
           // a file being written or emptied by a session that ended
         }
@@ -788,7 +835,7 @@ export const register: Register = on => {
       return `已关闭会话 ${other.slice(0, 8)} 的续命；它不会再发出续命请求。`
     }
 
-    api = { save, publish, arm, list, cost, now: refreshNow, offOther, ttlProblem, follow, watchEffort, disable, followSoon }
+    api = { save, publish, arm, list, cost, now: refreshNow, offOther, ttlProblem, follow, watchEffort, disable, followSoon, adoptDefault }
     home = (await $.env.get('HOME')) ?? ''
     showStatus = (await $.env.get('CACHE_KEEPALIVE_UI_STATUS')) !== '0'
     isDefaultOn = ((await $.env.get('CACHE_KEEPALIVE_DEFAULT')) ?? '').toLowerCase() === 'on'
@@ -846,6 +893,7 @@ export const register: Register = on => {
       await $.store.delete(`off:${sid}`)
       await $.store.delete(`optout:${sid}`)
       isOn = true
+      isDefaultPending = false
       isFused = false
       hasForked = false
       if (verb === 'max') base = MAX_CAP
@@ -853,7 +901,8 @@ export const register: Register = on => {
       max = cap
       // A one-off cap is for this absence: it lapses when the cache it buys would.
       capUntil = verb === 'on' && param ? (await $.clock.now()) + (cap * PING_AFTER + TTL) : 0
-      if (last) await $.store.set(`last:${sid}`, last)
+      const [id, seen] = [sid, last]
+      if (seen) await queued(() => $.store.set(`last:${id}`, seen))
       await api?.save()
       if (!isBusy) await api?.arm()
       else await api?.publish()
@@ -887,6 +936,16 @@ export const register: Register = on => {
     const upcoming = timer
       ? `，下次${dueKind === 'canary' ? '验证' : '续命'}在 ${fmtMin(dueAt - (await $.clock.now()))} 后`
       : ''
+    if (!isOn && isDefaultPending)
+      return { text: '缓存续命：关；这个会话发出第一条消息、本轮结束后会自动开启（CACHE_KEEPALIVE_DEFAULT=on）。' }
+    if (isOn && !hasRequestHere && !timer)
+      return { text: `缓存续命：已开启（${base === MAX_CAP ? '常驻' : '普通'}），但这个窗口还没发过消息：发出第一条消息、本轮结束后才开始续命，在此之前不发请求、不花钱。` }
+    if (isOn && !hasRequestHere) {
+      const due = fmtMin(dueAt - (await $.clock.now()))
+      return {
+        text: `缓存续命：已开启（${base === MAX_CAP ? '常驻' : '普通'}），本次已续 ${pings}/${max}；这个窗口还没确认能续，按计划在 ${due} 后尝试（插件重载后会成功并照常计费；新进程里没有可续的请求则不发出、不花钱，并提示先发一条消息）。`,
+      }
+    }
     return {
       text: `缓存续命：${isOn ? (isPaused ? '暂停（effort 已改）' : base === MAX_CAP ? '常驻' : '开') : '关'}，${isVerified ? '已验证' : '未验证'}，本次已续 ${pings}/${max}${upcoming}${note ? `；${note}` : ''}。`,
     }
@@ -941,7 +1000,8 @@ export const register: Register = on => {
       // Without the settings this request went out with, a change could not be seen:
       // forget the last request whether or not this one was answered.
       last = undefined
-      if (isOn) await $.store.delete(`last:${sid}`)
+      const id = sid
+      if (isOn) await queued(() => $.store.delete(`last:${id}`))
       return r
     }
     if (r && r.usage) {
@@ -953,14 +1013,19 @@ export const register: Register = on => {
         effort: e.effort,
         effortSig: sig,
       }
+      hasRequestHere = true
       // Kept across reloads of the mod, for sessions with keep-alive on only. A new
       // process can't use it: $.model.fork needs a main request made in this process.
-      if (isOn) await $.store.set(`last:${sid}`, last)
+      const [id, seen] = [sid, last]
+      if (isOn) await queued(() => $.store.set(`last:${id}`, seen))
     }
     return r
   })
 
   on('turn.complete', async ($, e, next) => {
+    // The stretch this turn belongs to, taken before any await: a /resume or /clear
+    // during the awaits below moves on to another session, and nothing here may touch it.
+    const [g0, s0] = [gen, sid]
     let r
     try {
       r = await next(e)
@@ -973,13 +1038,16 @@ export const register: Register = on => {
       }
     }
     if (e.agentId === undefined) {
-      if (e.reason === 'answer') await api?.arm()
-      else {
+      if (e.reason === 'answer') {
+        await api?.adoptDefault(g0, s0)
+        if (gen !== g0 || sid !== s0) return r
+        await api?.arm()
+      } else {
         cancel()
         note = '上一轮未正常结束，不续'
         await api?.publish()
       }
-      if (isOn) await api?.save() // the session was seen: its record stays
+      if (isOn && gen === g0 && sid === s0) await api?.save() // the session was seen: its record stays
     }
     return r
   })
@@ -1010,7 +1078,8 @@ export const register: Register = on => {
       isCompacting = false
       last = undefined
       pings = 0
-      await $.store.delete(`last:${sid}`)
+      const id = sid
+      await queued(() => $.store.delete(`last:${id}`))
       note = '已压缩，等下一轮请求后再续'
       await api?.publish()
     }
@@ -1021,10 +1090,13 @@ export const register: Register = on => {
     forgetSession()
     if (ended) await $.store.delete(`busy:${ended}`)
     if (e.reason === 'clear' && ended) {
-      await $.store.delete(`last:${ended}`)
-      await $.store.delete(`on:${ended}`)
-      await $.store.delete(`off:${ended}`)
-      await $.store.delete(`optout:${ended}`)
+      // Behind any save still queued, so none lands after and brings a record back.
+      await queued(async () => {
+        await $.store.delete(`last:${ended}`)
+        await $.store.delete(`on:${ended}`)
+        await $.store.delete(`off:${ended}`)
+        await $.store.delete(`optout:${ended}`)
+      }).catch(() => undefined) // a failed delete must not keep the session from ending
     }
     if (e.reason === 'resume') api?.followSoon()
     if (home && ended) await $.fs.write(`${statusDir()}/${ended}.json`, '{}')
