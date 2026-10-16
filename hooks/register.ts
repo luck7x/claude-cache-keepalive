@@ -305,6 +305,8 @@ export const register: Register = on => {
       capUntil = isCapLive ? (saved?.capUntil ?? 0) : 0
       last = stored
       anchor = Math.max(saved?.anchor ?? 0, last?.at ?? 0)
+      // A refresh made by an earlier process still warms the cache: status lines count from it.
+      refreshedAt = anchor > (last?.at ?? 0) ? anchor : 0
       pings = saved?.pings ?? 0
       isFused = saved?.isFused ?? false
       hasForked = saved?.hasForked ?? false
