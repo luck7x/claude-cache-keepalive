@@ -1,4 +1,4 @@
-import type { Register, Timer } from 'claude-code'
+import type { Register, StateDollar, Timer } from 'claude-code'
 
 // Keeps the main conversation's 1h prompt cache warm while the person is away,
 // by asking $.model.fork (Claude Code's own request over the main thread's last
@@ -31,6 +31,10 @@ const EFFORT_EVERY = 2_000 // how often an idle session looks for an effort chan
 const EFFORT_CHANGED = 'effort-changed' // blocker's answer: pause, don't stop
 const BUSY_FOR = 6 * 60 * MIN // a turn marker older than this is a crash, not a turn
 const TOMBSTONE_MAX = 30 * DAY // a session that never came back to take its off in
+// This process's token for its current session, so a status file or busy marker it wrote is
+// told from one another process wrote for the same conversation (an old window still open
+// while a new one resumes it). The host holds it in $.state, so a reload of the mod keeps it.
+const OWNER_REF = { plugin: 'cache-keepalive', key: 'owner' } as const
 // Models whose cache survives an effort change on the Claude API (API key or
 // subscription), per Claude Code's prompt-caching docs; elsewhere effort is part of the cache.
 const EFFORT_KEEPS_CACHE = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1']
@@ -67,6 +71,7 @@ type Row = {
   paused?: boolean
   note?: string
   updated?: number
+  owner?: string // the process that wrote it (ownerOf)
 }
 type Lock = { sid: string; at: number; token: string }
 // `on:<sid>` in the store. `at` is when the session was last seen (any turn or refresh),
@@ -207,6 +212,37 @@ function effortSig(settings: Readonly<Record<string, unknown>>, env: string | un
   return JSON.stringify(env || own || settings.effortLevel || null)
 }
 
+// A status file as written, or undefined (none, being written, or emptied).
+function parseRow(text: string): Row | undefined {
+  try {
+    const r = JSON.parse(text) as Row
+    return r && typeof r === 'object' ? r : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// Read from the host every time: it clears $.state when a session ends (/resume, /clear),
+// so a token cached here would outlive it and never be written back for the next session.
+async function ownerOf($: StateDollar): Promise<string> {
+  const held = await $.state.get(OWNER_REF)
+  if (held.value) return held.value
+  const mine = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  const w = await $.state.set(OWNER_REF, mine, { ifVersion: held.version })
+  // Lost to a write made meanwhile: take that one, so the session keeps a single token.
+  return w.isSet ? mine : ((await $.state.get(OWNER_REF)).value ?? mine)
+}
+
+// Drop the turn marker for `id`, unless another process put it there.
+async function clearBusy(
+  $: StateDollar & { store: { get(k: string): Promise<unknown>; delete(k: string): Promise<unknown> } },
+  id: string,
+) {
+  const busy = (await $.store.get(`busy:${id}`).catch(() => undefined)) as { owner?: string } | undefined
+  if (busy && (busy.owner === undefined || busy.owner === (await ownerOf($))))
+    await $.store.delete(`busy:${id}`).catch(() => undefined)
+}
+
 function cancel() {
   timer?.cancel()
   timer = undefined
@@ -283,9 +319,17 @@ export const register: Register = on => {
         paused: isPaused,
         note,
         updated: 0,
+        owner: await ownerOf($),
       }
       status.updated = await $.clock.now()
-      await $.fs.write(`${statusDir()}/${id}.json`, JSON.stringify(status))
+      const path = `${statusDir()}/${id}.json`
+      // On but not able to refresh here yet, while another process (or an older copy that
+      // wrote no owner) is refreshing this conversation, e.g. an old window still open after
+      // a /resume: leave its line on screen until it ends. An off here is always written.
+      const theirs = ui.isOn && !isLive ? await $.fs.read(path).then(parseRow, () => undefined) : undefined
+      const isTheirsLive =
+        !!theirs && theirs.owner !== status.owner && !!theirs.enabled && status.updated - (theirs.updated ?? 0) < TTL
+      if (!isTheirsLive) await $.fs.write(path, JSON.stringify(status))
       if (!showStatus || sid !== id) return
       const isStopped = /未命中|出错|熔断|已关闭|被其他窗口/.test(ui.note)
       if (!ui.isOn) return $.ui.status(isStopped ? `♻✗ ${ui.note}` : undefined)
@@ -366,7 +410,9 @@ export const register: Register = on => {
       cancel()
       isFused = true
       note = why
-      await save()
+      // A copy with no request here yet stops only itself: the shared record may be another
+      // process's that is still refreshing this conversation.
+      if (hasRequestHere) await save()
     }
 
     // The first turn here of a session nobody chose for, with CACHE_KEEPALIVE_DEFAULT=on:
@@ -683,7 +729,9 @@ export const register: Register = on => {
           return publish()
         }
         hasForked = true
-        await save()
+        // A copy with no request here yet (just resumed, or reloaded) may find nothing to fork:
+        // until a fork works, it writes nothing over the shared record another process may own.
+        if (hasRequestHere) await save()
         // The cache's clock restarts when the request is served, not when its reply ends.
         sent = await $.clock.now()
         // The remote-off check is the last await: nothing runs between it and the fork.
@@ -693,7 +741,7 @@ export const register: Register = on => {
         if (gen !== g || !isStillOn || isPaused || isOverCap) {
           if (isPaused && gen === g && sid === fireSid) wasArmed = true // held back, not dropped
           hasForked = false // no request was made
-          if (sid === fireSid) await save()
+          if (sid === fireSid && hasRequestHere) await save()
           return publish()
         }
         isForking = true
@@ -715,7 +763,6 @@ export const register: Register = on => {
         // Claude Code keeps what a fork replays in memory, per session: after a restart
         // or a /resume it exists only once this session has made a request here.
         note = '重启或 /resume 后还没发过消息：先发一条消息才能续命'
-        await save()
         return publish()
       }
       const u = 'usage' in r ? r.usage : undefined
@@ -984,7 +1031,7 @@ export const register: Register = on => {
     // them could let a ping out mid-turn. The next turn's completion clears them.
     if (api && !(await api.follow())) return next(e)
     isBusy = true // a load committed by follow() starts from a clean state
-    if (isOn) await $.store.set(`busy:${sid}`, { at: await $.clock.now() })
+    if (isOn) await $.store.set(`busy:${sid}`, { at: await $.clock.now(), owner: await ownerOf($) })
     // Back after a fork went out for it, or past its time: the one-off cap was for that absence.
     if (capUntil && (hasForked || (await $.clock.now()) > capUntil)) {
       max = base
@@ -1048,7 +1095,7 @@ export const register: Register = on => {
         // Cleared whatever happens in the chain, or a stuck flag would end keep-alive silently.
         isTurnActive = false
         isBusy = false
-        await $.store.delete(`busy:${sid}`).catch(() => undefined)
+        await clearBusy($, sid)
       }
     }
     if (e.agentId === undefined) {
@@ -1102,7 +1149,8 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     const ended = sid
     forgetSession()
-    if (ended) await $.store.delete(`busy:${ended}`)
+    // Another process may have this conversation open too: clear only what this one wrote.
+    if (ended) await clearBusy($, ended)
     if (e.reason === 'clear' && ended) {
       // Behind any save still queued, so none lands after and brings a record back.
       await queued(async () => {
@@ -1113,7 +1161,11 @@ export const register: Register = on => {
       }).catch(() => undefined) // a failed delete must not keep the session from ending
     }
     if (e.reason === 'resume') api?.followSoon()
-    if (home && ended) await $.fs.write(`${statusDir()}/${ended}.json`, '{}')
+    if (home && ended) {
+      const path = `${statusDir()}/${ended}.json`
+      const row = await $.fs.read(path).then(parseRow, () => undefined)
+      if (!row || row.owner === undefined || row.owner === (await ownerOf($))) await $.fs.write(path, '{}')
+    }
     return next(e)
   })
 }

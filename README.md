@@ -95,6 +95,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 - **多窗口**：用共享锁尽量让同一时间只有一个会话在续，其他错开 20–50 秒、只重试一次。存储不支持原子操作，极少数情况下两个会话可能同时发出；两次都是各自本来就要续的，不会多花钱。
 - **`/clear`、`/resume` 切换会话**：新会话不继承旧会话的开关和验证状态；`/clear` 会清掉旧会话的记录。
 - **重启 Claude Code 或 /resume 之后**：必须先在这个会话里发一条消息才能续命。续命请求复用的是 Claude Code 内存里"本进程最近一次主请求"，它不写盘，新进程或刚切换的会话里还没有；在这之前状态行不显示 ♻，`/keepalive list` 也不列出它（`/keepalive status` 会说明在等第一条消息），不发请求、不花钱。
+- **同一个对话在两个进程里开着**（比如 tmux 里的旧窗口还在续命，又在新窗口里 /resume 了它）：新进程在发出第一条消息之前，不会改写旧进程的续命记录和状态行，退出时也只清自己写的。想让新窗口发完第一条消息后自动关掉旧进程，可以配一个 Stop hook，本仓库不附带。
 - **上限为 0**（如 `/keepalive 1h`）：不验证也不续。临时上限（数字或时长）都会在它能撑到的时间过后自动失效，热重载也会保留它。
 - **Claude Code 热重载插件**：如果当时正在对话，等这一轮结束才重新计时；不在对话中则接着之前的计划续。
 - 关掉窗口，定时器随进程结束。
@@ -219,6 +220,7 @@ These checks are re-run right before a request goes out; they are best effort, n
 - **Several windows**: a shared lock tries to keep one fork at a time; others retry once 20–50 s later. The store has no atomic write, so on rare occasions two sessions may send at once; each was due anyway, so it costs nothing extra.
 - **`/clear`, `/resume`**: a new conversation inherits neither the switch nor the canary of the old one; `/clear` deletes the old one's records.
 - **After restarting Claude Code or a /resume**: send one message in that session before anything can be refreshed. A refresh replays Claude Code's in-memory copy of this process's last main request, which is never written to disk, so a new process or a just-switched session has none yet; until then the status line shows no ♻ and `/keepalive list` leaves it out (`/keepalive status` says it is waiting for a first message); nothing is sent and nothing is spent.
+- **One conversation open in two processes** (an old window in tmux still refreshing it, and a new window that /resumed it): until the new process has sent a message it does not overwrite the old one's records or status line, and on exit each clears only what it wrote. Closing the old process once the new window's first turn is done is left to a Stop hook of your own; none ships here.
 - **Cap 0** (e.g. `/keepalive 1h`): no canary, no refresh. A one-off cap (count or time) lapses when the cache it buys would, and survives a reload of the mod.
 - **A reload of the mod**: mid-turn, it waits for the turn to end; otherwise it carries on with the schedule.
 - Closing the window ends its timers.
