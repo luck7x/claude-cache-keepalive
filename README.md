@@ -55,6 +55,8 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 想让新会话自动开启（普通模式，每次离开最多续 2 次），在 `~/.claude/settings.json` 的 `env` 里加 `"CACHE_KEEPALIVE_DEFAULT": "on"`。会话在**第一轮对话结束后**才开启，只打开没说话的窗口不会开启、也不留记录。只对交互式窗口生效（`claude -p` 和 SDK 不会自动开启）；你对某个会话执行过 `/keepalive off`（包括从别的窗口关闭）后，它一直保持关闭，直到你再 `/keepalive on`。
 
+想改普通模式每次离开的续命次数，在 `env` 里加 `"CACHE_KEEPALIVE_PINGS": "8"`（1–24，默认 2）；能撑多久按下文"时间线"的公式算，8 次约 7 小时 48 分。
+
 | 命令 | 作用 |
 |---|---|
 | `/keepalive on` | 普通模式：每次离开最多续 2 次（约撑 2 小时 42 分）；会话第一次开启时另有 1 次验证 |
@@ -188,6 +190,8 @@ Answer `y` to add the marketplace, pick a scope (user is recommended). It is act
 Off by default; enabled per session, each window on its own.
 
 To have new sessions start on (normal mode, up to 2 refreshes per absence), add `"CACHE_KEEPALIVE_DEFAULT": "on"` to the `env` block of `~/.claude/settings.json`. A session turns on **after its first turn**; a window opened and never used is not turned on and leaves no record. Interactive windows only (`claude -p` and the SDK never start on); a session you turned off with `/keepalive off` (also from another window) stays off until `/keepalive on`.
+
+To change how many refreshes normal mode makes per absence, add `"CACHE_KEEPALIVE_PINGS": "8"` to `env` (1–24, default 2); 8 keeps the cache for about 7h48m (see the timeline formula below).
 
 | Command | Effect |
 |---|---|

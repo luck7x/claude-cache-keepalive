@@ -17,7 +17,7 @@ const JITTER = MIN // spread concurrent sessions apart
 const LATE = 2 * MIN // a timer later than this is skipped, never caught up
 const STALE = TTL - 3 * MIN // past this since the last touch the cache may have lapsed
 const CANARY_AFTER = 90_000
-const MAX_PINGS = 2 // default per idle stretch
+const MAX_PINGS = 2 // default per idle stretch; CACHE_KEEPALIVE_PINGS=<n> overrides it
 const MAX_CAP = 24 // what `/keepalive on <n|time>` may ask for (~21h)
 const MIN_PREFIX = 50_000
 const READ_OK = 0.9 // fork must read at least this share of the cached prefix
@@ -110,7 +110,8 @@ let api: Api | undefined
 let sid = ''
 let home = ''
 let cwd = ''
-let base = MAX_PINGS // the session's cap: MAX_PINGS, or MAX_CAP after `/keepalive max`
+let normalPings = MAX_PINGS // normal mode's cap: CACHE_KEEPALIVE_PINGS, else MAX_PINGS
+let base = MAX_PINGS // the session's cap: normalPings, or MAX_CAP after `/keepalive max`
 let max = MAX_PINGS // this absence's cap: `/keepalive on <n|time>` sets it; back to `base` once used or expired
 let capUntil = 0 // for a time given: when that time is up
 let isOn = false
@@ -257,7 +258,7 @@ function forgetSession() {
   isVerified = false
   isBusy = false
   isCompacting = false
-  base = max = MAX_PINGS
+  base = max = normalPings
   capUntil = 0
   last = undefined
   anchor = 0
@@ -371,7 +372,7 @@ export const register: Register = on => {
       isOn = wasOn
       isDefaultPending = isDefault && !wasOn
       isVerified = saved?.isVerified ?? false
-      base = saved?.base ?? MAX_PINGS
+      base = saved?.base === MAX_CAP ? MAX_CAP : normalPings // a normal cap follows CACHE_KEEPALIVE_PINGS as set now
       const isCapLive = saved?.max !== undefined && (saved.capUntil ?? 0) > now
       max = isCapLive ? (saved?.max ?? base) : base
       capUntil = isCapLive ? (saved?.capUntil ?? 0) : 0
@@ -428,7 +429,7 @@ export const register: Register = on => {
       isDefaultPending = false
       if (isOn || off !== undefined || optout !== undefined || ttl) return
       isOn = true
-      base = max = MAX_PINGS
+      base = max = normalPings
       // turn.step skipped `last:` while the session was off: keep this turn's for a reload,
       // queued behind the save and only if nothing newer came (a request, an off, /clear).
       const seen = last
@@ -899,6 +900,8 @@ export const register: Register = on => {
     home = (await $.env.get('HOME')) ?? ''
     showStatus = (await $.env.get('CACHE_KEEPALIVE_UI_STATUS')) !== '0'
     isDefaultOn = ((await $.env.get('CACHE_KEEPALIVE_DEFAULT')) ?? '').toLowerCase() === 'on'
+    const pingsEnv = (await $.env.get('CACHE_KEEPALIVE_PINGS')) ?? ''
+    normalPings = /^\d+$/.test(pingsEnv) ? Math.min(MAX_CAP, Math.max(1, Number(pingsEnv))) : MAX_PINGS
     isInteractive = e.isInteractive === true
     await load(await $.session.id()) // false: superseded; the state stays off until the next follow()
 
@@ -946,7 +949,7 @@ export const register: Register = on => {
     if (verb && parseCap(verb) !== undefined) [verb, param] = ['on', verb]
     if (verb === 'on' && param === 'max') [verb, param] = ['max', '']
     if (verb === 'max' || verb === 'on') {
-      const cap = verb === 'max' ? MAX_CAP : param ? parseCap(param) : MAX_PINGS
+      const cap = verb === 'max' ? MAX_CAP : param ? parseCap(param) : normalPings
       if (cap === undefined) return { text: `看不懂"${param}"：写次数（如 3）或大概多久回来（如 8h、90m、2h30m）。` }
       const ttl = await api?.ttlProblem()
       if (ttl) return { text: `没有开启：${ttl}。` }
@@ -958,7 +961,7 @@ export const register: Register = on => {
       overruns = 0
       hasForked = false
       if (verb === 'max') base = MAX_CAP
-      else if (!param) base = MAX_PINGS // plain `on` is the normal mode
+      else if (!param) base = normalPings // plain `on` is the normal mode
       max = cap
       // A one-off cap is for this absence: it lapses when the cache it buys would.
       capUntil = verb === 'on' && param ? (await $.clock.now()) + (cap * PING_AFTER + TTL) : 0
@@ -975,7 +978,7 @@ export const register: Register = on => {
         return {
           text: `常驻续命已开启：${check}每次离开最多续 ${MAX_CAP} 次（缓存约可撑 ${reach}${price}），回来后不重置。在场时不花钱；关窗口、额度到 ${QUOTA_STOP}%、未命中都会停。/keepalive on 回普通模式，/keepalive off 关闭。`,
         }
-      const back = base === MAX_CAP ? `常驻 ${MAX_CAP}` : `默认 ${MAX_PINGS}`
+      const back = base === MAX_CAP ? `常驻 ${MAX_CAP}` : `默认 ${normalPings}`
       return { text: `缓存续命已开启：${check}本次离开最多续 ${cap} 次，缓存约可撑 ${reach}${price}。你回来后恢复为 ${back} 次。` }
     }
     if (verb === 'now') return { text: (await api?.now()) || '没有执行。' }
@@ -987,7 +990,7 @@ export const register: Register = on => {
       // A choice that outlives the 3-day cleanup, so CACHE_KEEPALIVE_DEFAULT=on never
       // turns a resumed session back on; only `/keepalive on|max` or /clear clears it.
       await $.store.set(`optout:${sid}`, { at: await $.clock.now() })
-      base = max = MAX_PINGS
+      base = max = normalPings
       capUntil = 0
       await api?.disable('')
       await api?.publish()
