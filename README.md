@@ -59,7 +59,7 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 | 命令 | 作用 |
 |---|---|
-| `/keepalive on` | 普通模式：每次离开最多续 2 次（约撑 2 小时 42 分）；会话第一次开启时另有 1 次验证 |
+| `/keepalive on` | 普通模式：每次离开最多续 2 次（约撑 2 小时 42 分） |
 | `/keepalive 5`、`/keepalive 8h`、`/keepalive 2h30m` | 只对这一次离开加长；写时长会按"大概多久回来"自动算次数 |
 | `/keepalive max` | 常驻模式：每次离开都最多续 24 次（约 21 小时），回来后不重置 |
 | `/keepalive now` | 立刻续一次（不计入次数） |
@@ -72,7 +72,6 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 ```
 0 分        最后一次请求
-1.5 分      首次验证（每个会话第一次开启时）
 51 分       续命 1
 102 分      续命 2
 162 分      缓存过期（默认上限 2 次时）
@@ -84,21 +83,21 @@ Claude Code 每次请求都会把整段上下文（工具、系统提示、全�
 
 续命最大的风险是"以为在续，其实在整段重写"。下面这些检查都会在发出请求前再确认一遍，但它们是尽力而为，不是绝对保证：
 
-- **首次验证**：读到的缓存必须 ≥ 预期前缀的 90%、写入 ≤ 10%，否则自动关闭。
-- **任何一次没命中**：本次离开不再续。
-- **定时器迟到 2 分钟以上**（机器睡眠过）：跳过，不补发。
+- **开关只听你的**：只有 `/keepalive on|off|max` 能改开关。续命出任何问题，最多停掉这一次离开，下一轮正常对话结束后自动恢复。
+- **只看 usage 判断缓存**：读到缓存、重写不超过前缀的 20%，算续上；重写超过 20%，本次离开不再续（一次离开最多多付一次重写）；请求失败、没有 usage，说明不了缓存的情况，每 90 秒重试，直到距上次触碰满 57 分钟。认证失败、请求非法这类重试没用的错误不重试。
+- **机器睡眠过**：醒来时还没到 57 分钟线就照常续，过了就不补发。
 - **距上次触碰缓存超过 57 分钟**：跳过。
 - **上下文 < 50k**：不续（重建本来就便宜）。
 - **正在对话、刚压缩、换了模型、上一轮被中断**：不续，等下一轮正常结束再计时。
 - **改了思考等级（effort）**：在 Opus 5.5、Sonnet 5.5、Haiku 5.5、Fable 5.1 上（API key 或订阅直连），改 effort **不会**让缓存失效（[官方说明](https://code.claude.com/docs/en/prompt-caching#changing-effort-level)），续命照常。其他模型改 effort 会让缓存失效；用了 Bedrock / Vertex / Foundry、设置了 `ANTHROPIC_BASE_URL` 或 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` 时可能失效，插件稳妥起见同样处理。这些情况下：**续命暂停**并弹出提示，状态行的 ♻ 消失；**改回原来的 effort 会自动恢复**；按新 effort 发一条消息，则重写一次缓存后按新 effort 续命。空闲时每 2 秒检查一次，`/effort`、`/model` 之后立即检查，续命前也会再查。插件按 Claude Code 的优先级（`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<模型>.effortLevel` → `effortLevel`）取值。只在当前会话生效、没写进设置或环境变量的改动检测不到；HIPAA 组织等插件检测不到的情况，可能多花一次没命中的续命，随后自动停止。
 - **与空闲压缩互斥**：Claude Code 2.1.299 起会在你离开约 54 分钟、缓存过期前自动压缩较长的对话（空闲压缩）。它看不到续命请求，压缩后续命就白做了。所以**开着续命的会话里，插件会拦下空闲压缩**，`/keepalive status` 会显示"已拦下空闲压缩"；关掉续命后恢复。手动 `/compact` 和上下文满了的自动压缩不受影响。想让所有会话都不做空闲压缩，可以在 `~/.claude/settings.json` 里加 `"idleCompaction": false`。
 - **5 小时或 7 天额度 ≥ 95%**：跳过。
-- **单次输出 > 200 token**（含思考）：缓存照样续上了，按计划继续；同一次离开里第 3 次超出才停止（`$.model.fork` 不能设置 max_tokens 或关闭思考，只能事后熔断）。
+- **单次输出 > 10k token**（含思考）：这次缓存照样续上了，但本次离开不再续（`$.model.fork` 不能设置 max_tokens，发出后也无法中止，只能事后熔断）。上限定得高，是因为停止续命的代价（回来后重写）远大于多输出几百 token。
 - **多窗口**：用共享锁尽量让同一时间只有一个会话在续，其他错开 20–50 秒、只重试一次。存储不支持原子操作，极少数情况下两个会话可能同时发出；两次都是各自本来就要续的，不会多花钱。
-- **`/clear`、`/resume` 切换会话**：新会话不继承旧会话的开关和验证状态；`/clear` 会清掉旧会话的记录。
+- **`/clear`、`/resume` 切换会话**：新会话不继承旧会话的开关；`/clear` 会清掉旧会话的记录。
 - **重启 Claude Code 或 /resume 之后**：必须先在这个会话里发一条消息才能续命。续命请求复用的是 Claude Code 内存里"本进程最近一次主请求"，它不写盘，新进程或刚切换的会话里还没有；在这之前状态行不显示 ♻，`/keepalive list` 也不列出它（`/keepalive status` 会说明在等第一条消息），不发请求、不花钱。
 - **同一个对话在两个进程里开着**（比如 tmux 里的旧窗口还在续命，又在新窗口里 /resume 了它）：新进程在发出第一条消息之前，不会改写旧进程的续命记录和状态行，退出时也只清自己写的。想让新窗口发完第一条消息后自动关掉旧进程，可以配一个 Stop hook，本仓库不附带。
-- **上限为 0**（如 `/keepalive 1h`）：不验证也不续。临时上限（数字或时长）都会在它能撑到的时间过后自动失效，热重载也会保留它。
+- **上限为 0**（如 `/keepalive 1h`）：不续。临时上限（数字或时长）都会在它能撑到的时间过后自动失效，热重载也会保留它。
 - **Claude Code 热重载插件**：如果当时正在对话，等这一轮结束才重新计时；不在对话中则接着之前的计划续。
 - 关掉窗口，定时器随进程结束。
 
@@ -195,7 +194,7 @@ To change how many refreshes normal mode makes per absence, add `"CACHE_KEEPALIV
 
 | Command | Effect |
 |---|---|
-| `/keepalive on` | Normal mode: up to 2 refreshes per absence (~2h42m); plus one canary the first time in a session |
+| `/keepalive on` | Normal mode: up to 2 refreshes per absence (~2h42m) |
 | `/keepalive 5`, `/keepalive 8h`, `/keepalive 2h30m` | Longer cap for this absence only; a duration is turned into the refreshes needed |
 | `/keepalive max` | Always-on mode: up to 24 refreshes (~21h) every absence, kept after you return |
 | `/keepalive now` | Refresh once right now (not counted) |
@@ -211,21 +210,21 @@ How long the cache lasts = refreshes × 51 min + 60 min. Each refresh adds 0–6
 These checks are re-run right before a request goes out; they are best effort, not hard guarantees.
 
 
-- **Canary** on first enable: it must read ≥ 90% of the expected prefix and write ≤ 10%, or the plugin turns itself off.
-- **Any miss** stops refreshing for the rest of that absence.
-- **Timer late by > 2 min** (the machine slept): skipped, never caught up.
+- **The switch is yours**: only `/keepalive on|off|max` change it. Whatever goes wrong with a refresh stops at most that absence; the next normal turn starts again.
+- **Usage decides**: cache read with at most 20% of the prefix rewritten counts as kept; more than 20% rewritten stops refreshing for that absence (at most one rewrite per absence); a failed request with no usage says nothing about the cache, so it is retried every 90 s until 57 min after the last touch. Errors a retry can't cure (authentication, invalid request) are not retried.
+- **The machine slept**: refreshed on waking if still before the 57-minute line, otherwise never caught up.
 - **> 57 min since the cache was last touched**: skipped.
 - **Context < 50k tokens**: not refreshed (rebuilding is cheap).
 - **Turn in progress, just compacted, model changed, last turn interrupted**: not refreshed until the next normal turn.
 - **Effort changed**: on Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1 (API key or subscription, direct), changing effort **keeps** the cache ([docs](https://code.claude.com/docs/en/prompt-caching#changing-effort-level)) and keep-alive carries on. On other models it invalidates the cache; with Bedrock / Vertex / Foundry, `ANTHROPIC_BASE_URL` or `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` set it may, and the plugin plays safe the same way. In those cases: **keep-alive pauses** with a notice and the ♻ disappears; **setting effort back resumes it**; sending a message at the new effort rewrites the cache once and keep-alive carries on at that effort. Checked every 2 seconds while idle, right after `/effort` and `/model`, and again before a refresh, using Claude Code's order (`CLAUDE_CODE_EFFORT_LEVEL` → `modelSettings.<model>.effortLevel` → `effortLevel`). A change made for the session only is not seen; where the plugin cannot tell (a HIPAA organization, say), one refresh may miss and be paid for before keep-alive stops.
 - **Exclusive with idle compaction**: from Claude Code 2.1.299, a long conversation is compacted about 54 minutes into an absence, before its cache lapses (idle compaction). It does not see keep-alive's refreshes, so compacting throws them away. **In a session with keep-alive on, the plugin holds idle compaction back** (`/keepalive status` says so); turning keep-alive off lets it run again. `/compact` and compaction at a full context are untouched. To stop idle compaction in every session, add `"idleCompaction": false` to `~/.claude/settings.json`.
 - **5-hour or 7-day quota ≥ 95%**: skipped.
-- **Output > 200 tokens** (thinking included) in a refresh: the cache was still kept, so refreshing carries on; the third time in one absence stops it (`$.model.fork` takes no max_tokens and no thinking setting).
+- **Output > 10k tokens** (thinking included) in a refresh: the cache was still kept, but refreshing stops for that absence (`$.model.fork` takes no max_tokens and no thinking setting).
 - **Several windows**: a shared lock tries to keep one fork at a time; others retry once 20–50 s later. The store has no atomic write, so on rare occasions two sessions may send at once; each was due anyway, so it costs nothing extra.
-- **`/clear`, `/resume`**: a new conversation inherits neither the switch nor the canary of the old one; `/clear` deletes the old one's records.
+- **`/clear`, `/resume`**: a new conversation does not inherit the old one's switch; `/clear` deletes the old one's records.
 - **After restarting Claude Code or a /resume**: send one message in that session before anything can be refreshed. A refresh replays Claude Code's in-memory copy of this process's last main request, which is never written to disk, so a new process or a just-switched session has none yet; until then the status line shows no ♻ and `/keepalive list` leaves it out (`/keepalive status` says it is waiting for a first message); nothing is sent and nothing is spent.
 - **One conversation open in two processes** (an old window in tmux still refreshing it, and a new window that /resumed it): until the new process has sent a message it does not overwrite the old one's records or status line, and on exit each clears only what it wrote. Closing the old process once the new window's first turn is done is left to a Stop hook of your own; none ships here.
-- **Cap 0** (e.g. `/keepalive 1h`): no canary, no refresh. A one-off cap (count or time) lapses when the cache it buys would, and survives a reload of the mod.
+- **Cap 0** (e.g. `/keepalive 1h`): no refresh. A one-off cap (count or time) lapses when the cache it buys would, and survives a reload of the mod.
 - **A reload of the mod**: mid-turn, it waits for the turn to end; otherwise it carries on with the schedule.
 - Closing the window ends its timers.
 

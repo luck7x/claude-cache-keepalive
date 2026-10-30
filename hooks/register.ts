@@ -3,10 +3,12 @@ import type { Register, StateDollar, Timer } from 'claude-code'
 // Keeps the main conversation's 1h prompt cache warm while the person is away,
 // by asking $.model.fork (Claude Code's own request over the main thread's last
 // prefix, no transcript row, tool-less) a one-word question shortly before the
-// cache would lapse. Off until `/keepalive on`. Every doubt stops it:
-// a first "canary" fork must show the cache was read, not rewritten; a timer that
-// fires late (the machine slept), a turn in progress, a compaction or a model
-// change all skip; any miss ends the idle stretch. While it is on, Claude Code's idle
+// cache would lapse. Off until `/keepalive on`. Only the person's commands turn it on or
+// off; what happens to a refresh ends at most this idle stretch, and the next real turn
+// starts a new one. Only a fork's usage says what became of the cache: read with little
+// rewritten moves the cache's clock on; much rewritten ends the stretch; no usage at all
+// says nothing, so it is tried again while the cache can still be reached. A turn in
+// progress, a compaction or a model change all skip. While it is on, Claude Code's idle
 // compaction is held back for that session (the two are exclusive).
 
 const MIN = 60_000
@@ -14,18 +16,19 @@ const DAY = 24 * 60 * MIN
 const TTL = 60 * MIN
 const PING_AFTER = 51 * MIN // after the last confirmed cache touch
 const JITTER = MIN // spread concurrent sessions apart
-const LATE = 2 * MIN // a timer later than this is skipped, never caught up
+const LATE = 2 * MIN // `/keepalive list`: a window this late with its timer is gone
 const STALE = TTL - 3 * MIN // past this since the last touch the cache may have lapsed
-const CANARY_AFTER = 90_000
+const RETRY_AFTER = 90_000 // after a fork that got no usage back, until STALE
 const MAX_PINGS = 2 // default per idle stretch; CACHE_KEEPALIVE_PINGS=<n> overrides it
 const MAX_CAP = 24 // what `/keepalive on <n|time>` may ask for (~21h)
 const MIN_PREFIX = 50_000
-const READ_OK = 0.9 // fork must read at least this share of the cached prefix
-const WRITE_MAX = 0.1 // and write at most this share of it
+const REWRITE_MAX = 0.2 // a fork writing more than this share of the prefix ends the stretch
 const LOCK_MS = 90_000 // one fork at a time across sessions
 const QUOTA_STOP = 95 // skip pings once a 5h / 7d window is this full (%)
-const OUTPUT_MAX = 200 // a fork that writes more than this (thinking included) is not a cheap ping
-const OVERRUN_MAX = 3 // the third such reply in one absence stops it; the first two carry on
+// A fork can't be capped or cut (tested: a hook that settles early leaves the request running),
+// so this only stops the next one. Stopping costs a rewrite on return, far more than a few
+// hundred tokens of output: only a runaway reply, about $0.20 on Opus, is worth it.
+const OUTPUT_MAX = 10_000
 const FORGET_AFTER = 3 * DAY // store records of sessions not seen for this long
 const EFFORT_EVERY = 2_000 // how often an idle session looks for an effort change (a local read)
 const EFFORT_CHANGED = 'effort-changed' // blocker's answer: pause, don't stop
@@ -46,11 +49,10 @@ const CACHE_READ_PRICE: Record<string, number> = {
   'claude-haiku-5-5': 0.01,
 }
 // $.model.fork takes no output cap (nor thinking or effort settings: it replays the main
-// thread's), so the prompt keeps the reply short and OUTPUT_MAX / OVERRUN_MAX stop the stretch.
+// thread's), so the prompt keeps the reply short and OUTPUT_MAX stops the stretch.
 const PROMPT =
   'Cache keep-alive ping. This needs no reasoning: do not think, do not use tools. Reply with exactly "." and nothing else.'
 
-type Kind = 'canary' | 'ping'
 // `effortSig` is what the settings said about effort when the request was made; a
 // different one later means effort was changed. Where effort is part of the cache
 // (see EFFORT_KEEPS_CACHE) the next turn then rewrites the conversation's cache and a
@@ -66,7 +68,7 @@ type Row = {
   pings?: number
   max?: number
   next?: number
-  nextKind?: Kind | null
+  nextKind?: 'ping' | null
   refreshedAt?: number
   paused?: boolean
   note?: string
@@ -78,7 +80,6 @@ type Lock = { sid: string; at: number; token: string }
 // `anchor` its last confirmed cache touch, so a reload of the mod can resume the schedule.
 type Saved = {
   isOn: boolean
-  isVerified: boolean
   at: number
   base?: number
   max?: number
@@ -87,7 +88,6 @@ type Saved = {
   pings?: number
   isFused?: boolean // this idle stretch was stopped: no more pings until a real turn
   hasForked?: boolean // a fork went out since the cap was set
-  overruns?: number // refreshes this stretch whose output passed OUTPUT_MAX
 }
 
 type Api = {
@@ -115,7 +115,6 @@ let base = MAX_PINGS // the session's cap: normalPings, or MAX_CAP after `/keepa
 let max = MAX_PINGS // this absence's cap: `/keepalive on <n|time>` sets it; back to `base` once used or expired
 let capUntil = 0 // for a time given: when that time is up
 let isOn = false
-let isVerified = false
 let isBusy = false
 // A main turn is running in this process. Unlike isBusy it survives a session load
 // (forgetSession), so a load committed mid-turn still knows the turn is on.
@@ -133,7 +132,6 @@ let anchor = 0 // last time the cache was confirmed touched
 let refreshedAt = 0 // last successful fork, for status lines' countdowns
 let pings = 0
 let isFused = false
-let overruns = 0 // refreshes this absence whose output passed OUTPUT_MAX
 let hasForked = false
 // Effort now differs from the last request's: no refresh (the cache it would keep
 // can't be used at this effort) until it is set back, or a turn runs at the new one.
@@ -154,7 +152,6 @@ function queued(op: () => Promise<unknown>): Promise<void> {
 }
 let timer: Timer | undefined
 let dueAt = 0
-let dueKind: Kind | undefined
 let note = ''
 let showStatus = true // CACHE_KEEPALIVE_UI_STATUS=0 hides the line under the prompt
 let isDefaultOn = false // CACHE_KEEPALIVE_DEFAULT=on: sessions nobody chose for start on
@@ -247,7 +244,6 @@ async function clearBusy(
 function cancel() {
   timer?.cancel()
   timer = undefined
-  dueKind = undefined
 }
 
 // Everything that belongs to one conversation; a /clear or /resume starts another.
@@ -255,7 +251,6 @@ function forgetSession() {
   cancel()
   gen += 1
   isOn = false
-  isVerified = false
   isBusy = false
   isCompacting = false
   base = max = normalPings
@@ -265,7 +260,6 @@ function forgetSession() {
   refreshedAt = 0
   pings = 0
   isFused = false
-  overruns = 0
   hasForked = false
   isPaused = false
   pausedFrom = ''
@@ -283,7 +277,7 @@ export const register: Register = on => {
       // Session and fields as they are now: a switch during the awaits must not mix them.
       // Queued, so an older save (a default-on) never lands after a newer one (an off).
       const id = sid
-      const v: Saved = { isOn, isVerified, at: 0, base, max, capUntil, anchor, pings, isFused, hasForked, overruns }
+      const v: Saved = { isOn, at: 0, base, max, capUntil, anchor, pings, isFused, hasForked }
       return queued(async () => {
         v.at = await $.clock.now()
         await $.store.set(`on:${id}`, v)
@@ -304,18 +298,18 @@ export const register: Register = on => {
       // that worked here (after a mod reload). A timer alone proves nothing: in a new
       // process it ends in nothing-to-fork.
       const isLive = isOn && hasRequestHere
-      const ui = { isOn, isLive, isPaused, note, base, pings, max, isTimer: !!timer, dueAt, dueKind }
+      const ui = { isOn, isLive, isPaused, note, base, pings, max, isTimer: !!timer, dueAt }
       const status: Row = {
         sid,
         cwd,
         model: last?.model,
         cached: last?.cached,
         enabled: isLive,
-        verified: isVerified,
+        verified: true, // no longer a state; status lines written for older versions read it
         pings,
         max,
         next: timer ? dueAt : 0,
-        nextKind: timer ? (dueKind ?? null) : null,
+        nextKind: timer ? 'ping' : null,
         refreshedAt,
         paused: isPaused,
         note,
@@ -337,7 +331,7 @@ export const register: Register = on => {
       if (ui.isPaused || !ui.isLive) return $.ui.status(undefined)
       const at = ui.isTimer ? new Date(ui.dueAt).toTimeString().slice(0, 5) : ''
       const mode = ui.base === MAX_CAP ? '常驻 ' : ''
-      const upcoming = ui.isTimer ? ` · 下次${ui.dueKind === 'canary' ? '验证' : '续命'} ${at}` : ''
+      const upcoming = ui.isTimer ? ` · 下次续命 ${at}` : ''
       $.ui.status(`♻ ${mode}${ui.pings}/${ui.max}${upcoming}${isStopped ? ` · ${ui.note}` : ''}`)
     }
 
@@ -353,8 +347,9 @@ export const register: Register = on => {
       ])
       // Nobody chose for this session yet (no record, no off from another window):
       // CACHE_KEEPALIVE_DEFAULT=on turns it on in normal mode after its first turn here
-      // (adoptDefault), interactive sessions only.
-      const isUnchosen = saved === undefined && isDefaultOn && isInteractive
+      // (adoptDefault), interactive sessions only. A record that says off with no optout
+      // is no choice either: only versions before 1.0.14 wrote one, on a failed canary.
+      const isUnchosen = !saved?.isOn && isDefaultOn && isInteractive
       const isDefault =
         isUnchosen &&
         (await $.store.get(`off:${id}`)) === undefined &&
@@ -371,7 +366,6 @@ export const register: Register = on => {
       cwd = dir
       isOn = wasOn
       isDefaultPending = isDefault && !wasOn
-      isVerified = saved?.isVerified ?? false
       base = saved?.base === MAX_CAP ? MAX_CAP : normalPings // a normal cap follows CACHE_KEEPALIVE_PINGS as set now
       const isCapLive = saved?.max !== undefined && (saved.capUntil ?? 0) > now
       max = isCapLive ? (saved?.max ?? base) : base
@@ -382,7 +376,6 @@ export const register: Register = on => {
       refreshedAt = anchor > (last?.at ?? 0) ? anchor : 0
       pings = saved?.pings ?? 0
       isFused = saved?.isFused ?? false
-      overruns = saved?.overruns ?? 0
       hasForked = saved?.hasForked ?? false
       // A reload can land mid-turn: the turn's own marker says so.
       isBusy = isTurnActive || (busy !== undefined && now - busy.at < BUSY_FOR)
@@ -453,7 +446,7 @@ export const register: Register = on => {
 
     // `g0`/`id`: the generation and session the caller started in. A caller from an
     // older stretch (a turn or switch came since) touches nothing, not even the timer.
-    async function schedule(at: number, kind: Kind, g0: number, id: string, isRetry = false) {
+    async function schedule(at: number, g0: number, id: string, isRetry = false) {
       if (gen !== g0 || sid !== id) return
       cancel()
       // A refresh held back by a pause is remembered, so a set-back of effort brings it.
@@ -468,10 +461,9 @@ export const register: Register = on => {
         return
       }
       dueAt = at
-      dueKind = kind
       timer = $.clock.after(Math.max(0, at - now), () => {
         const [g, s0] = [gen, sid]
-        void fire(kind, false, isRetry).catch(async err => {
+        void fire(false, isRetry).catch(async err => {
           if (gen !== g || sid !== s0) return // the stretch it belonged to is over
           await stopStretch(`出错停止: ${String(err).slice(0, 80)}`)
           await publish()
@@ -485,7 +477,6 @@ export const register: Register = on => {
       const [g0, id] = [gen, sid] // the stretch this call is for; a turn or switch ends it
       pings = 0
       isFused = false
-      overruns = 0
       if (!(await synced())) return publish()
       if (!last) {
         note = '先在这个会话发一条消息，之后开始计时续命'
@@ -509,23 +500,18 @@ export const register: Register = on => {
       // Turned on some minutes after the last request: a time already past means
       // "soon", not "late" (the STALE check in fire still guards a lapsed cache).
       const soon = (await $.clock.now()) + 5_000
-      if (!isVerified) await schedule(Math.max(last.at + CANARY_AFTER, soon), 'canary', g0, id)
-      else await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, soon), 'ping', g0, id)
+      await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, soon), g0, id)
       return publish()
     }
 
-    // After a reload of the mod mid-session: carry on with the pings, never a canary
-    // (a reload may land mid-turn, where a canary would only cost money).
-    // `canCanary`: known idle (an effort set back), so a pending canary may go out too.
-    async function resume(canCanary = false) {
+    // After a reload of the mod mid-session, or an effort set back: carry on with the pings.
+    async function resume() {
       if (isFused || isBusy || isPaused || !isOn || !last || last.cached < MIN_PREFIX || pings >= max) return publish()
-      if (!isVerified && !canCanary) return publish()
       const [g0, id] = [gen, sid]
       const now = await $.clock.now()
       if (gen !== g0 || sid !== id || isBusy || isPaused || !isOn || isFused) return
       if (now - anchor > STALE) return publish()
-      if (!isVerified) await schedule(Math.max(last.at + CANARY_AFTER, now + 5_000), 'canary', g0, id)
-      else await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, now + 5_000), 'ping', g0, id)
+      await schedule(Math.max(anchor + PING_AFTER + Math.random() * JITTER, now + 5_000), g0, id)
       return publish()
     }
 
@@ -623,7 +609,7 @@ export const register: Register = on => {
       const armed = wasArmed
       wasArmed = false
       // A fork in flight schedules the next refresh itself once it settles.
-      return armed && !isForking ? resume(true) : publish()
+      return armed && !isForking ? resume() : publish()
     }
 
     // Effort is watched every couple of seconds while idle, and right after /effort and
@@ -663,7 +649,6 @@ export const register: Register = on => {
       if (isBusy) return ''
       if (isCompacting) return '正在压缩，本次不续'
       const now = await $.clock.now()
-      if (!isManual && now - dueAt > LATE) return '定时器迟到（可能休眠过），本次不续'
       if (now - anchor > STALE) return '缓存可能已过期，本次不续'
       const model = await $.session.model()
       if (!sameModel(model, seen.model)) return `模型已切换（${seen.model} → ${model}），本次不续`
@@ -675,7 +660,7 @@ export const register: Register = on => {
       return undefined
     }
 
-    async function fire(kind: Kind, isManual = false, isRetry = false) {
+    async function fire(isManual = false, isRetry = false) {
       if (!isManual) timer = undefined
       if (!(await follow())) return
       if (!isManual && isFused) return publish()
@@ -690,7 +675,7 @@ export const register: Register = on => {
       if (early === EFFORT_CHANGED) {
         const moved = await effortMoved(seen)
         if (gen !== g || sid !== fireSid) return publish()
-        return moved !== undefined ? pause(seen, moved, true) : resume(true) // set back already: keep the stretch
+        return moved !== undefined ? pause(seen, moved, true) : resume() // set back already: keep the stretch
       }
       if (early !== undefined) {
         if (early && !isManual) await stopStretch(early)
@@ -707,7 +692,7 @@ export const register: Register = on => {
         // Another session is forking: one more try shortly, if there is still room.
         const retry = (await $.clock.now()) + 20_000 + Math.random() * 30_000
         if (!isRetry && retry - anchor < STALE - MIN) {
-          await schedule(retry, kind, g, fireSid, true)
+          await schedule(retry, g, fireSid, true)
           return publish()
         }
         await stopStretch('其他会话占用，本次不续')
@@ -722,7 +707,7 @@ export const register: Register = on => {
         if (late === EFFORT_CHANGED) {
           const moved = await effortMoved(seen)
           if (gen !== g || sid !== fireSid) return publish()
-          return moved !== undefined ? pause(seen, moved, true) : resume(true) // set back already: keep the stretch
+          return moved !== undefined ? pause(seen, moved, true) : resume() // set back already: keep the stretch
         }
         if (gen !== g || late !== undefined) {
           if (late && !isManual && gen === g) await stopStretch(late)
@@ -769,50 +754,62 @@ export const register: Register = on => {
       const u = 'usage' in r ? r.usage : undefined
       const read = u?.cache_read_input_tokens ?? 0
       const wrote = u?.cache_creation_input_tokens ?? 0
+      const input = u?.input_tokens ?? 0
       const out = u?.output_tokens ?? 0
+      // No usage says nothing about the cache: nothing changes, and the cache may still be
+      // reached. A failed request costs next to nothing, so it is tried again until STALE,
+      // unless the error is one a retry can't cure.
+      if (!r.isAnswered && read + wrote + input === 0) {
+        const why = r.reason === 'api-error' ? `${r.error}${r.status ? ` ${r.status}` : ''}` : r.reason
+        if (isManual) {
+          note = `手动续命失败（${why}）`
+          return publish()
+        }
+        const isLasting =
+          r.reason === 'api-error' &&
+          (r.error === 'authentication_failed' ||
+            r.error === 'invalid_request' ||
+            (r.status !== null && r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429))
+        const retry = (await $.clock.now()) + RETRY_AFTER
+        if (isLasting || retry - anchor >= STALE) {
+          await stopStretch(`续命出错（${why}），本次熔断`)
+          return publish()
+        }
+        note = `请求失败（${why}），${RETRY_AFTER / 1000} 秒后重试`
+        await schedule(retry, g, fireSid)
+        return publish()
+      }
       // Only whether the reply was the expected ".": its text never reaches disk.
       const reply = !r.isAnswered ? '' : r.text.trim() === '.' ? ' 回复"."' : ` 回复非预期（${r.text.length} 字）`
       const spent = `读${kTok(read)} 写${kTok(wrote)} 出${out}${reply}`
-      const isHit = r.isAnswered && read >= READ_OK * seen.cached && wrote <= WRITE_MAX * seen.cached
+      // Part of a prefix rewritten is the rest kept, so a small rewrite carries on; a large
+      // one says the fork no longer matches the cache and the next would pay again.
+      const isHit = read > 0 && wrote + input <= REWRITE_MAX * seen.cached
 
-      if (r.isAnswered) hasRequestHere = true // the fork found this process's request: it can refresh
+      if (r.isAnswered || read > 0) hasRequestHere = true // the fork found this process's request: it can refresh
       if (!isHit) {
         cancel()
-        if (kind === 'canary') {
-          isVerified = false
-          await disable(`验证未命中（${spent}），已关闭`)
-        } else {
-          await stopStretch(`续命未命中（${spent}），本次熔断`)
-        }
+        await stopStretch(`续命未命中（${spent}），本次熔断`)
         return publish()
       }
 
       anchor = at
       refreshedAt = at
-      if (kind === 'canary') {
-        isVerified = true
-        note = `验证通过（${spent}）`
-      } else if (isManual) {
+      if (isManual) {
         note = `手动续命（${spent}）`
       } else {
         pings += 1
         note = `第${pings}次续命（${spent}）`
       }
-      // The cache was kept, but a reply over OUTPUT_MAX cost real output (the model thought,
-      // which the prompt can't forbid). Counted before the save, so a reload keeps the count.
-      if (out > OUTPUT_MAX) overruns += 1
       await save()
+      // The cache was kept, but a reply over OUTPUT_MAX cost real output (the model thought,
+      // which the prompt can't forbid): the next one could too.
       if (out > OUTPUT_MAX) {
-        // Carry on as planned; the OVERRUN_MAX-th time ends the stretch.
-        if (overruns >= OVERRUN_MAX) {
-          await stopStretch(`${note}，输出 ${out} token 超过 ${OUTPUT_MAX}（本次离开第 ${overruns} 次），本次熔断`)
-          return publish()
-        }
-        note += `，输出 ${out} token 超过 ${OUTPUT_MAX}（本次离开第 ${overruns}/${OVERRUN_MAX} 次），继续`
+        await stopStretch(`${note}，输出 ${out} token 超过 ${OUTPUT_MAX}，本次熔断`)
+        return publish()
       }
       if (isBusy || !isOn || isFused) return publish()
-      if (kind === 'canary' ? max > 0 : pings < max)
-        await schedule(anchor + PING_AFTER + Math.random() * JITTER, 'ping', g, fireSid)
+      if (pings < max) await schedule(anchor + PING_AFTER + Math.random() * JITTER, g, fireSid)
       else note += '，已达上限'
       return publish()
     }
@@ -851,7 +848,7 @@ export const register: Register = on => {
             ? r.note || (r.cached ? '等待本轮结束' : '先在该会话发一条消息，之后开始续命')
             : r.next < now - LATE
               ? '已失联（窗口可能已关闭）'
-              : `${r.nextKind === 'canary' ? '验证' : '续命'}在 ${fmtMin(r.next - now)} 后`
+              : `续命在 ${fmtMin(r.next - now)} 后`
           return `- ${r.sid?.slice(0, 8)}${me} ${r.cwd ?? ''} | ${kTok(r.cached ?? 0)} | 已续 ${r.pings ?? 0}/${r.max ?? 0} | ${state}`
         })
       return [`开着缓存续命的窗口（${rows.length}）：`, ...lines].join('\n')
@@ -862,9 +859,7 @@ export const register: Register = on => {
       const price = readPrice(last.model)
       if (price === undefined) return ''
       const one = (last.cached * price) / 1e6
-      const total = n + (isVerified || n === 0 ? 0 : 1)
-      const canary = isVerified || n === 0 ? '' : '（含首次验证 1 次）'
-      return `，按当前 ${kTok(last.cached)} 上下文每次约 $${one.toFixed(3)}，最多约 $${(one * total).toFixed(2)}${canary}`
+      return `，按当前 ${kTok(last.cached)} 上下文每次约 $${one.toFixed(3)}，最多约 $${(one * n).toFixed(2)}`
     }
 
     // `/keepalive now`: one refresh right away, outside the schedule.
@@ -873,7 +868,7 @@ export const register: Register = on => {
       if (!last) return '这个会话还没有可续的请求：先完成一轮对话。'
       if (isBusy) return '正在对话中，缓存本来就是热的。'
       if (last.cached < MIN_PREFIX) return `上下文 ${kTok(last.cached)} < ${kTok(MIN_PREFIX)}，不值得续。`
-      await fire(isVerified ? 'ping' : 'canary', true)
+      await fire(true)
       return note
     }
 
@@ -925,8 +920,6 @@ export const register: Register = on => {
       }
       if (kind === 'on:' && (await $.store.get(`off:${id}`)) !== undefined) continue // keep it for the check above
       if (typeof v?.at !== 'number' || now - v.at > FORGET_AFTER) {
-        // An off from before `optout:` existed (1.0.6 and older) is kept as one.
-        if (kind === 'on:' && (v as Saved | undefined)?.isOn === false) await $.store.set(`optout:${id}`, { at: now })
         await $.store.delete(key)
       }
     }
@@ -958,7 +951,6 @@ export const register: Register = on => {
       isOn = true
       isDefaultPending = false
       isFused = false
-      overruns = 0
       hasForked = false
       if (verb === 'max') base = MAX_CAP
       else if (!param) base = normalPings // plain `on` is the normal mode
@@ -972,14 +964,13 @@ export const register: Register = on => {
       else await api?.publish()
       const reach = fmtMin(cap * PING_AFTER + TTL)
       const price = (await api?.cost(cap)) ?? ''
-      const check = isVerified || cap === 0 ? '' : `先在上一轮结束约 ${CANARY_AFTER / 1000} 秒后验证一次（算一次续命的钱）；`
       if (cap === 0) return { text: `缓存续命已开启，但这次离开不需要续：1 小时内缓存本来就在。` }
       if (verb === 'max')
         return {
-          text: `常驻续命已开启：${check}每次离开最多续 ${MAX_CAP} 次（缓存约可撑 ${reach}${price}），回来后不重置。在场时不花钱；关窗口、额度到 ${QUOTA_STOP}%、未命中都会停。/keepalive on 回普通模式，/keepalive off 关闭。`,
+          text: `常驻续命已开启：每次离开最多续 ${MAX_CAP} 次（缓存约可撑 ${reach}${price}），回来后不重置。在场时不花钱；关窗口、额度到 ${QUOTA_STOP}%、未命中都会停。/keepalive on 回普通模式，/keepalive off 关闭。`,
         }
       const back = base === MAX_CAP ? `常驻 ${MAX_CAP}` : `默认 ${normalPings}`
-      return { text: `缓存续命已开启：${check}本次离开最多续 ${cap} 次，缓存约可撑 ${reach}${price}。你回来后恢复为 ${back} 次。` }
+      return { text: `缓存续命已开启：本次离开最多续 ${cap} 次，缓存约可撑 ${reach}${price}。你回来后恢复为 ${back} 次。` }
     }
     if (verb === 'now') return { text: (await api?.now()) || '没有执行。' }
     if (verb === 'off' && param) {
@@ -998,7 +989,7 @@ export const register: Register = on => {
     }
     if (verb === 'list') return { text: (await api?.list()) ?? '' }
     const upcoming = timer
-      ? `，下次${dueKind === 'canary' ? '验证' : '续命'}在 ${fmtMin(dueAt - (await $.clock.now()))} 后`
+      ? `，下次续命在 ${fmtMin(dueAt - (await $.clock.now()))} 后`
       : ''
     if (!isOn && isDefaultPending)
       return { text: '缓存续命：关；这个会话发出第一条消息、本轮结束后会自动开启（CACHE_KEEPALIVE_DEFAULT=on）。' }
@@ -1011,7 +1002,7 @@ export const register: Register = on => {
       }
     }
     return {
-      text: `缓存续命：${isOn ? (isPaused ? '暂停（effort 已改）' : base === MAX_CAP ? '常驻' : '开') : '关'}，${isVerified ? '已验证' : '未验证'}，本次已续 ${pings}/${max}${upcoming}${note ? `；${note}` : ''}。`,
+      text: `缓存续命：${isOn ? (isPaused ? '暂停（effort 已改）' : base === MAX_CAP ? '常驻' : '开') : '关'}，本次已续 ${pings}/${max}${upcoming}${note ? `；${note}` : ''}。`,
     }
   })
 
